@@ -119,13 +119,35 @@ class QueryResponse(BaseModel):
 
 # ── Core agent loop ───────────────────────────────────────────────────────────
 
+async def extract_keywords(query: str) -> str:
+    """Use the LLM to extract the key biomedical term from a natural language query."""
+    response = await llm.chat.completions.create(
+        model=MODEL,
+        messages=[
+            {"role": "system", "content": "Extract the single most important biomedical keyword or concept name from the user's question. Reply with ONLY the keyword, nothing else. Examples: 'what variables are related to asthma' → 'asthma', 'find studies about high cholesterol' → 'cholesterol', 'show me diabetes research' → 'diabetes'."},
+            {"role": "user", "content": query},
+        ],
+    )
+    keyword = (response.choices[0].message.content or query).strip().strip('"').strip("'")
+    log.info(f"Extracted keyword: '{keyword}' from query: '{query}'")
+    return keyword
+
+
 async def run_agent(query: str, system_prompt: str) -> QueryResponse:
     if _mcp_session is None:
         raise HTTPException(503, "MCP server not connected")
 
+    # Extract the key biomedical term so Gemma-3 uses it in tool args
+    keyword = await extract_keywords(query)
+
+    user_message = (
+        f"{query}\n\n"
+        f"[Key search term to use in tool arguments: '{keyword}']"
+    )
+
     messages = [
         {"role": "system", "content": system_prompt},
-        {"role": "user",   "content": query},
+        {"role": "user",   "content": user_message},
     ]
 
     tools_used: list[str] = []
@@ -192,8 +214,8 @@ async def run_agent(query: str, system_prompt: str) -> QueryResponse:
             all_results = []
             # Build a lookup of required args per tool
             tool_schema = {t["function"]["name"]: t["function"].get("parameters", {}) for t in _openai_tools}
-            # Extract keywords from original query for fallback arg filling
-            user_query = messages[1]["content"] if len(messages) > 1 else ""
+            # Use extracted keyword for fallback arg filling
+            user_query = keyword
 
             for tc in parsed_text_calls:
                 tool_name = tc.get("function") or tc.get("name", "")

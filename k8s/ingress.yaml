@@ -1,0 +1,27 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: redis-graph-agent
+  namespace: your-namespace
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt
+    nginx.ingress.kubernetes.io/cors-allow-headers: Content-Type
+    nginx.ingress.kubernetes.io/cors-allow-methods: POST, GET, OPTIONS
+    nginx.ingress.kubernetes.io/enable-cors: "true"
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: redis-graph-agent.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: redis-graph-agent
+                port:
+                  number: 8080
+  tls:
+    - hosts:
+        - redis-graph-agent.example.com
+      secretName: redis-graph-agent.example.com-tls
