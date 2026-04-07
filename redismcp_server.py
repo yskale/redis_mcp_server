@@ -1,0 +1,809 @@
+#!/usr/bin/env python3
+"""
+Redis Graph MCP Server
+Provides Model Context Protocol interface to query biomedical knowledge graph stored in Redis
+"""
+
+import os
+import asyncio
+import argparse
+import redis
+from redis.commands.graph import Graph
+
+from mcp.server import Server
+from mcp.server.stdio import stdio_server
+from mcp.server.sse import SseServerTransport
+from mcp.types import Tool, TextContent
+from dotenv import load_dotenv
+import uvicorn
+
+# Load environment variables from .env file
+load_dotenv()
+# Initialize MCP server
+app = Server("redis-graph-server")
+
+# Redis connection pool (initialized on first use)
+redis_client = None
+graph_db = None
+
+
+def get_redis_connection():
+    """Establish Redis connection with authentication"""
+    global redis_client, graph_db
+
+    if redis_client is None:
+        host = os.getenv("REDIS_HOST", "localhost")
+        port = int(os.getenv("REDIS_PORT", "6379"))
+        password = os.getenv("REDIS_PASSWORD")
+        graph_name = os.getenv("REDIS_GRAPH_NAME", "test")
+
+        try:
+            redis_client = redis.Redis(
+                host=host,
+                port=port,
+                password=password,
+                decode_responses=True,
+                socket_connect_timeout=5,
+                socket_keepalive=True
+            )
+            # Test connection
+            redis_client.ping()
+            graph_db = Graph(redis_client, graph_name)
+        except Exception:
+            raise
+
+    return redis_client, graph_db
+
+
+@app.list_tools()
+async def list_tools() -> list[Tool]:
+    """List available tools for querying the Redis graph"""
+    return [
+        Tool(
+            name="cypher_query",
+            description="Execute a raw Cypher query on the Redis biomedical knowledge graph. Use backticks for labels with dots: `biolink.Disease`",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Cypher query to execute. Remember to escape biolink labels with backticks: (n:`biolink.Disease`)"
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Override LIMIT clause (optional)",
+                        "default": 50
+                    }
+                },
+                "required": ["query"]
+            }
+        ),
+        Tool(
+            name="search_concepts",
+            description="Search for biomedical concepts by name (diseases, phenotypes, procedures, etc.) OR find variables related to a concept",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "search_term": {
+                        "type": "string",
+                        "description": "Concept name or keyword to search for (e.g., 'cholesterol', 'heart disease', 'asthma')"
+                    },
+                    "node_type": {
+                        "type": "string",
+                        "description": "Optional: Filter by node type (Disease, PhenotypicFeature, Procedure, Cell, OrganismTaxon, etc.)",
+                        "enum": ["Disease", "PhenotypicFeature", "Procedure", "Cell", "OrganismTaxon", "Study", "Publication", "BiologicalProcess"]
+                    },
+                    "find_variables": {
+                        "type": "boolean",
+                        "description": "Set to true to find StudyVariables connected to the concept instead of the concept itself",
+                        "default": False
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Maximum results",
+                        "default": 20
+                    }
+                },
+                "required": ["search_term"]
+            }
+        ),
+        Tool(
+            name="get_concept_graph",
+            description="Get the complete subgraph for a biomedical concept including studies, variables, and related entities",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "concept_id": {
+                        "type": "string",
+                        "description": "The concept ID (e.g., MONDO:0005015 for disease, phv00283870.v1.p1 for variable)"
+                    },
+                    "expand_depth": {
+                        "type": "integer",
+                        "description": "How many hops to follow (1-3)",
+                        "default": 2
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Maximum nodes to return",
+                        "default": 100
+                    }
+                },
+                "required": ["concept_id"]
+            }
+        ),
+        Tool(
+            name="find_connected_studies",
+            description="Find all studies connected to a concept through StudyVariables",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "concept_id": {
+                        "type": "string",
+                        "description": "Concept ID to search from"
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Maximum results",
+                        "default": 50
+                    }
+                },
+                "required": ["concept_id"]
+            }
+        ),
+        Tool(
+            name="get_concept_connections",
+            description="Count and list what types of entities are connected to a concept",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "concept_id": {
+                        "type": "string",
+                        "description": "Concept ID to analyze"
+                    }
+                },
+                "required": ["concept_id"]
+            }
+        ),
+        Tool(
+            name="list_graph_schema",
+            description="List all node types and relationships in the graph",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "show_counts": {
+                        "type": "boolean",
+                        "description": "Include count of each node type",
+                        "default": True
+                    }
+                }
+            }
+        ),
+        Tool(
+            name="find_highly_connected_variables",
+            description="Find StudyVariables with the most connections to biomedical concepts",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "min_connections": {
+                        "type": "integer",
+                        "description": "Minimum number of connections",
+                        "default": 10
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Maximum results",
+                        "default": 20
+                    }
+                }
+            }
+        ),
+        Tool(
+            name="explore_concept_neighborhood",
+            description="Explore the immediate neighborhood of a concept with detailed relationship information",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "concept_id": {
+                        "type": "string",
+                        "description": "Concept ID to explore"
+                    },
+                    "node_type_filter": {
+                        "type": "string",
+                        "description": "Optional: Filter neighbors by type",
+                        "enum": ["Disease", "PhenotypicFeature", "Procedure", "Cell", "OrganismTaxon", "Study", "StudyVariable"]
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Maximum neighbors to return",
+                        "default": 50
+                    }
+                },
+                "required": ["concept_id"]
+            }
+        ),
+        Tool(
+            name="search_variables_by_name",
+            description="Search for StudyVariables directly by name or ID pattern",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "search_term": {
+                        "type": "string",
+                        "description": "Variable name or ID pattern to search for (e.g., 'cholesterol', 'phv00')"
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Maximum results",
+                        "default": 20
+                    }
+                },
+                "required": ["search_term"]
+            }
+        ),
+        Tool(
+            name="get_variable_details",
+            description="Get detailed information about a specific StudyVariable including all its connections",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "variable_id": {
+                        "type": "string",
+                        "description": "Variable ID (e.g., phv00400480.v1.p1)"
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Maximum connections to return",
+                        "default": 50
+                    }
+                },
+                "required": ["variable_id"]
+            }
+        ),
+        Tool(
+            name="expand_concept",
+            description="Expand a biomedical concept by finding related concepts, synonyms, and transitive connections up to N hops away",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "concept_id": {
+                        "type": "string",
+                        "description": "Concept ID to expand (e.g., MONDO:0004784 for allergic asthma)"
+                    },
+                    "max_hops": {
+                        "type": "integer",
+                        "description": "Maximum number of hops/relationships to traverse (1-3)",
+                        "default": 2
+                    },
+                    "relationship_types": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Optional: Filter by specific relationship types (e.g., ['related_to', 'part_of'])"
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Maximum number of expanded concepts to return",
+                        "default": 50
+                    }
+                },
+                "required": ["concept_id"]
+            }
+        ),
+        Tool(
+            name="find_concept_paths",
+            description="Find paths between two biomedical concepts through the knowledge graph",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "source_id": {
+                        "type": "string",
+                        "description": "Source concept ID"
+                    },
+                    "target_id": {
+                        "type": "string",
+                        "description": "Target concept ID"
+                    },
+                    "max_path_length": {
+                        "type": "integer",
+                        "description": "Maximum path length to search (1-5)",
+                        "default": 3
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Maximum number of paths to return",
+                        "default": 10
+                    }
+                },
+                "required": ["source_id", "target_id"]
+            }
+        )
+    ]
+
+
+def format_query_results(result_set, header=None) -> str:
+    """Format query results nicely"""
+    if not result_set:
+        return "No results found."
+
+    # Extract column names from header (format: [[type_code, col_name], ...])
+    formatted_lines = []
+    if header:
+        col_names = [col[1] for col in header]
+        formatted_lines.append(" | ".join(col_names))
+        formatted_lines.append("-" * (sum(len(c) for c in col_names) + 3 * len(col_names)))
+
+    # Add all data rows with truncation for very long values
+    for row in result_set:
+        truncated_row = []
+        for v in row:
+            if v is None:
+                truncated_row.append("NULL")
+            else:
+                str_v = str(v)
+                if len(str_v) > 200:
+                    truncated_row.append(str_v[:197] + "...")
+                else:
+                    truncated_row.append(str_v)
+        formatted_lines.append(" | ".join(truncated_row))
+
+    return "\n".join(formatted_lines)
+
+
+@app.call_tool()
+async def call_tool(name: str, arguments: dict) -> list[TextContent]:
+    """Handle tool calls"""
+    try:
+        _, graph = get_redis_connection()
+        
+        if name == "cypher_query":
+            query = arguments["query"]
+
+            # Execute query
+            result = graph.query(query)
+
+            # Format results
+            if result.result_set and len(result.result_set) > 0:
+                formatted = format_query_results(result.result_set, result.header)
+                stats = f"\n\nRows returned: {len(result.result_set)}"
+                if result.execution_time:
+                    stats += f"\nExecution time: {result.execution_time}ms"
+
+                response_text = formatted + stats
+                # Limit total response size
+                if len(response_text) > 50000:
+                    response_text = response_text[:50000] + f"\n\n... (truncated for display)"
+
+                return [TextContent(type="text", text=response_text)]
+            else:
+                return [TextContent(type="text", text="Query executed successfully but returned no results.")]
+        
+        elif name == "search_concepts":
+            search_term = arguments["search_term"]
+            node_type = arguments.get("node_type")
+            find_variables = arguments.get("find_variables", False)
+            limit = arguments.get("limit", 20)
+
+            # If user wants variables related to a concept
+            if find_variables:
+                query = f"""
+                MATCH (concept)-[*1..2]-(v:`biolink.StudyVariable`)
+                WHERE concept.name CONTAINS '{search_term}'
+                RETURN DISTINCT
+                    labels(concept)[0] AS concept_type,
+                    concept.name AS concept_name,
+                    v.name AS variable_name,
+                    v.id AS variable_id
+                LIMIT {limit}
+                """
+                result = graph.query(query)
+
+                if result.result_set and len(result.result_set) > 0:
+                    formatted = format_query_results(result.result_set, result.header)
+                    result_count = len(result.result_set)
+                    response_text = f"Found {result_count} variables related to '{search_term}':\n\n{formatted}"
+
+                    if len(response_text) > 50000:
+                        response_text = response_text[:50000] + f"\n\n... (truncated, showing first portion of {result_count} results)"
+
+                    return [TextContent(type="text", text=response_text)]
+                else:
+                    return [TextContent(type="text", text=f"No variables found related to '{search_term}'")]
+
+            # Otherwise search for concepts by name
+            else:
+                if node_type:
+                    query = f"""
+                    MATCH (n:`biolink.{node_type}`)
+                    WHERE n.name CONTAINS '{search_term}'
+                    RETURN labels(n)[0] AS type, n.name AS name, n.id AS id
+                    LIMIT {limit}
+                    """
+                else:
+                    query = f"""
+                    MATCH (n)
+                    WHERE n.name CONTAINS '{search_term}'
+                    RETURN labels(n)[0] AS type, n.name AS name, n.id AS id
+                    LIMIT {limit}
+                    """
+
+                result = graph.query(query)
+
+                if result.result_set and len(result.result_set) > 0:
+                    formatted = format_query_results(result.result_set, result.header)
+                    result_count = len(result.result_set)
+                    response_text = f"Found {result_count} concepts:\n\n{formatted}"
+
+                    # Limit total response size to prevent hanging
+                    if len(response_text) > 50000:
+                        response_text = response_text[:50000] + f"\n\n... (truncated, showing first portion of {result_count} results)"
+
+                    return [TextContent(type="text", text=response_text)]
+                else:
+                    return [TextContent(type="text", text=f"No concepts found matching '{search_term}'")]
+        
+        elif name == "get_concept_graph":
+            concept_id = arguments["concept_id"]
+            expand_depth = min(arguments.get("expand_depth", 2), 3)
+            limit = arguments.get("limit", 100)
+            
+            # FIXED: Proper backtick escaping
+            if expand_depth == 1:
+                query = f"""
+                MATCH (concept {{id: "{concept_id}"}})-[r1]-(connected)
+                RETURN concept.name AS concept, 
+                       type(r1) AS rel_type,
+                       labels(connected)[0] AS connected_type,
+                       connected.name AS connected_name,
+                       connected.id AS connected_id
+                LIMIT {limit}
+                """
+            else:
+                query = f"""
+                MATCH (concept {{id: "{concept_id}"}})-[r1]-(variable:`biolink.StudyVariable`)
+                OPTIONAL MATCH (variable)-[r2]-(study:`biolink.Study`)
+                OPTIONAL MATCH (variable)-[r3]-(related)
+                WHERE related <> concept
+                RETURN DISTINCT
+                    concept.name AS concept,
+                    concept.id AS concept_id,
+                    labels(concept)[0] AS concept_type,
+                    variable.name AS variable_name,
+                    variable.id AS variable_id,
+                    study.name AS study_name,
+                    study.id AS study_id,
+                    COUNT(DISTINCT related) AS related_concepts_count
+                LIMIT {limit}
+                """
+            
+            result = graph.query(query)
+            
+            if result.result_set:
+                formatted = format_query_results(result.result_set, result.header)
+                return [TextContent(type="text", text=f"Concept subgraph for {concept_id}:\n\n{formatted}")]
+            else:
+                return [TextContent(type="text", text=f"No data found for concept ID: {concept_id}")]
+        
+        elif name == "find_connected_studies":
+            concept_id = arguments["concept_id"]
+            limit = arguments.get("limit", 50)
+            
+            # FIXED: Proper backtick escaping
+            query = f"""
+            MATCH (concept {{id: "{concept_id}"}})--(variable:`biolink.StudyVariable`)--(study:`biolink.Study`)
+            RETURN DISTINCT
+                concept.name AS concept,
+                variable.name AS variable_name,
+                variable.id AS variable_id,
+                study.name AS study_name,
+                study.id AS study_id
+            LIMIT {limit}
+            """
+            
+            result = graph.query(query)
+            
+            if result.result_set:
+                formatted = format_query_results(result.result_set, result.header)
+                return [TextContent(type="text", text=f"Studies connected to {concept_id}:\n\n{formatted}")]
+            else:
+                return [TextContent(type="text", text=f"No studies found connected to {concept_id}")]
+        
+        elif name == "get_concept_connections":
+            concept_id = arguments["concept_id"]
+            
+            query = f"""
+            MATCH (concept {{id: "{concept_id}"}})-[r]-(connected)
+            WITH concept, labels(connected)[0] AS entity_type, COUNT(*) AS count
+            RETURN concept.name AS concept, entity_type, count
+            ORDER BY count DESC
+            """
+            
+            result = graph.query(query)
+            
+            if result.result_set:
+                formatted = format_query_results(result.result_set, result.header)
+                return [TextContent(type="text", text=f"Connection analysis for {concept_id}:\n\n{formatted}")]
+            else:
+                return [TextContent(type="text", text=f"No connections found for {concept_id}")]
+        
+        elif name == "list_graph_schema":
+            show_counts = arguments.get("show_counts", True)
+            
+            if show_counts:
+                query = """
+                MATCH (n)
+                WITH labels(n)[0] AS node_type, COUNT(*) AS count
+                RETURN node_type, count
+                ORDER BY count DESC
+                """
+            else:
+                query = """
+                MATCH (n)
+                WITH DISTINCT labels(n)[0] AS node_type
+                RETURN node_type
+                ORDER BY node_type
+                """
+            
+            result = graph.query(query)
+            
+            if result.result_set:
+                formatted = format_query_results(result.result_set, result.header)
+                return [TextContent(type="text", text=f"Graph Schema:\n\n{formatted}")]
+            else:
+                return [TextContent(type="text", text="Could not retrieve graph schema")]
+        
+        elif name == "find_highly_connected_variables":
+            min_connections = arguments.get("min_connections", 10)
+            limit = arguments.get("limit", 20)
+            
+            query = f"""
+            MATCH (v:`biolink.StudyVariable`)--(c)
+            WITH v, COUNT(DISTINCT c) AS connection_count
+            WHERE connection_count >= {min_connections}
+            RETURN v.name AS variable_name, v.id AS variable_id, connection_count
+            ORDER BY connection_count DESC
+            LIMIT {limit}
+            """
+            
+            result = graph.query(query)
+            
+            if result.result_set:
+                formatted = format_query_results(result.result_set, result.header)
+                return [TextContent(type="text", text=f"Highly connected variables (>= {min_connections} connections):\n\n{formatted}")]
+            else:
+                return [TextContent(type="text", text=f"No variables found with {min_connections}+ connections")]
+        
+        elif name == "explore_concept_neighborhood":
+            concept_id = arguments["concept_id"]
+            node_type_filter = arguments.get("node_type_filter")
+            limit = arguments.get("limit", 50)
+            
+            if node_type_filter:
+                query = f"""
+                MATCH (concept {{id: "{concept_id}"}})-[r]-(neighbor:`biolink.{node_type_filter}`)
+                RETURN concept.name AS concept,
+                       type(r) AS relationship,
+                       labels(neighbor)[0] AS neighbor_type,
+                       neighbor.name AS neighbor_name,
+                       neighbor.id AS neighbor_id
+                LIMIT {limit}
+                """
+            else:
+                query = f"""
+                MATCH (concept {{id: "{concept_id}"}})-[r]-(neighbor)
+                RETURN concept.name AS concept,
+                       type(r) AS relationship,
+                       labels(neighbor)[0] AS neighbor_type,
+                       neighbor.name AS neighbor_name,
+                       neighbor.id AS neighbor_id
+                LIMIT {limit}
+                """
+            
+            result = graph.query(query)
+            
+            if result.result_set:
+                formatted = format_query_results(result.result_set, result.header)
+                return [TextContent(type="text", text=f"Neighborhood of {concept_id}:\n\n{formatted}")]
+            else:
+                return [TextContent(type="text", text=f"No neighbors found for {concept_id}")]
+        
+        elif name == "search_variables_by_name":
+            search_term = arguments["search_term"]
+            limit = arguments.get("limit", 20)
+
+            query = f"""
+            MATCH (v:`biolink.StudyVariable`)
+            WHERE v.name CONTAINS '{search_term}' OR v.id CONTAINS '{search_term}'
+            RETURN v.id AS variable_id, v.name AS variable_name
+            LIMIT {limit}
+            """
+
+            result = graph.query(query)
+
+            if result.result_set and len(result.result_set) > 0:
+                formatted = format_query_results(result.result_set, result.header)
+                result_count = len(result.result_set)
+                response_text = f"Found {result_count} variables matching '{search_term}':\n\n{formatted}"
+
+                if len(response_text) > 50000:
+                    response_text = response_text[:50000] + f"\n\n... (truncated, showing first portion of {result_count} results)"
+
+                return [TextContent(type="text", text=response_text)]
+            else:
+                return [TextContent(type="text", text=f"No variables found matching '{search_term}'")]
+
+        elif name == "get_variable_details":
+            variable_id = arguments["variable_id"]
+            limit = arguments.get("limit", 50)
+
+            query = f"""
+            MATCH (v:`biolink.StudyVariable` {{id: "{variable_id}"}})
+            OPTIONAL MATCH (v)-[r]-(connected)
+            RETURN
+                v.id AS variable_id,
+                v.name AS variable_name,
+                type(r) AS relationship,
+                labels(connected)[0] AS connected_type,
+                connected.name AS connected_name,
+                connected.id AS connected_id
+            LIMIT {limit}
+            """
+
+            result = graph.query(query)
+
+            if result.result_set and len(result.result_set) > 0:
+                formatted = format_query_results(result.result_set, result.header)
+                response_text = f"Details for variable {variable_id}:\n\n{formatted}"
+
+                if len(response_text) > 50000:
+                    response_text = response_text[:50000] + f"\n\n... (truncated for display)"
+
+                return [TextContent(type="text", text=response_text)]
+            else:
+                return [TextContent(type="text", text=f"Variable not found: {variable_id}")]
+
+        elif name == "expand_concept":
+            concept_id = arguments["concept_id"]
+            max_hops = min(arguments.get("max_hops", 2), 3)
+            relationship_types = arguments.get("relationship_types")
+            limit = arguments.get("limit", 50)
+
+            # Build query based on whether relationship filter is specified
+            if relationship_types and len(relationship_types) > 0:
+                # With relationship type filtering - use WHERE clause instead
+                query = f"""
+                MATCH path = (source {{id: "{concept_id}"}})-[r*1..{max_hops}]-(expanded)
+                WHERE source <> expanded
+                  AND ALL(rel in relationships(path) WHERE type(rel) IN {relationship_types})
+                WITH expanded,
+                     labels(expanded)[0] AS expanded_type,
+                     length(path) AS hops,
+                     [rel in relationships(path) | type(rel)] AS path_relationships
+                RETURN DISTINCT
+                    expanded.id AS concept_id,
+                    expanded.name AS concept_name,
+                    expanded_type,
+                    hops,
+                    path_relationships
+                ORDER BY hops, expanded.name
+                LIMIT {limit}
+                """
+            else:
+                # No relationship filtering
+                query = f"""
+                MATCH path = (source {{id: "{concept_id}"}})-[r*1..{max_hops}]-(expanded)
+                WHERE source <> expanded
+                WITH expanded,
+                     labels(expanded)[0] AS expanded_type,
+                     length(path) AS hops,
+                     [rel in relationships(path) | type(rel)] AS path_relationships
+                RETURN DISTINCT
+                    expanded.id AS concept_id,
+                    expanded.name AS concept_name,
+                    expanded_type,
+                    hops,
+                    path_relationships
+                ORDER BY hops, expanded.name
+                LIMIT {limit}
+                """
+
+            result = graph.query(query)
+
+            if result.result_set and len(result.result_set) > 0:
+                formatted = format_query_results(result.result_set, result.header)
+                result_count = len(result.result_set)
+                response_text = f"Expanded {concept_id} to {result_count} related concepts:\n\n{formatted}"
+
+                if len(response_text) > 50000:
+                    response_text = response_text[:50000] + f"\n\n... (truncated, showing first portion)"
+
+                return [TextContent(type="text", text=response_text)]
+            else:
+                return [TextContent(type="text", text=f"No expanded concepts found for {concept_id}")]
+
+        elif name == "find_concept_paths":
+            source_id = arguments["source_id"]
+            target_id = arguments["target_id"]
+            max_path_length = min(arguments.get("max_path_length", 3), 5)
+            limit = arguments.get("limit", 10)
+
+            # Find shortest paths between concepts
+            query = f"""
+            MATCH path = shortestPath((source {{id: "{source_id}"}})-[*1..{max_path_length}]-(target {{id: "{target_id}"}}))
+            WITH path, length(path) AS path_length
+            UNWIND nodes(path) AS node
+            UNWIND relationships(path) AS rel
+            WITH path, path_length,
+                 collect(DISTINCT node.name) AS node_names,
+                 collect(DISTINCT type(rel)) AS relationship_types
+            RETURN
+                path_length,
+                node_names,
+                relationship_types
+            ORDER BY path_length
+            LIMIT {limit}
+            """
+
+            result = graph.query(query)
+
+            if result.result_set and len(result.result_set) > 0:
+                formatted = format_query_results(result.result_set, result.header)
+                result_count = len(result.result_set)
+                response_text = f"Found {result_count} paths from {source_id} to {target_id}:\n\n{formatted}"
+
+                if len(response_text) > 50000:
+                    response_text = response_text[:50000] + f"\n\n... (truncated)"
+
+                return [TextContent(type="text", text=response_text)]
+            else:
+                return [TextContent(type="text", text=f"No paths found between {source_id} and {target_id} (max length: {max_path_length})")]
+
+        else:
+            return [TextContent(type="text", text=f"Unknown tool: {name}")]
+
+    except Exception as e:
+        error_msg = f"Error executing tool '{name}': {str(e)}"
+        return [TextContent(type="text", text=error_msg)]
+
+
+def create_sse_app():
+    """Create a plain ASGI app that serves the MCP server over SSE"""
+    sse = SseServerTransport("/messages/")
+
+    async def asgi_app(scope, receive, send):
+        path = scope.get("path", "")
+        if scope["type"] == "http":
+            if path == "/sse":
+                async with sse.connect_sse(scope, receive, send) as streams:
+                    await app.run(streams[0], streams[1], app.create_initialization_options())
+            elif path.startswith("/messages/"):
+                await sse.handle_post_message(scope, receive, send)
+            else:
+                await send({"type": "http.response.start", "status": 404, "headers": []})
+                await send({"type": "http.response.body", "body": b"Not found"})
+        elif scope["type"] == "lifespan":
+            await receive()
+            await send({"type": "lifespan.startup.complete"})
+            await receive()
+            await send({"type": "lifespan.shutdown.complete"})
+
+    return asgi_app
+
+
+async def run_stdio():
+    async with stdio_server() as (read_stream, write_stream):
+        await app.run(read_stream, write_stream, app.create_initialization_options())
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Redis Graph MCP Server")
+    parser.add_argument("--transport", choices=["stdio", "sse"], default="stdio",
+                        help="Transport mode (default: stdio)")
+    parser.add_argument("--host", default="0.0.0.0", help="SSE host (default: 0.0.0.0)")
+    parser.add_argument("--port", type=int, default=8000, help="SSE port (default: 8000)")
+    args = parser.parse_args()
+
+    if args.transport == "sse":
+        print(f"Starting Redis Graph MCP server (SSE) on http://{args.host}:{args.port}/sse")
+        starlette_app = create_sse_app()
+        uvicorn.run(starlette_app, host=args.host, port=args.port)
+    else:
+        asyncio.run(run_stdio())

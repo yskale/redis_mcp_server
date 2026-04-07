@@ -1,0 +1,59 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: redis-mcp-server
+  namespace: your-namespace
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: redis-mcp-server
+  template:
+    metadata:
+      labels:
+        app: redis-mcp-server
+    spec:
+      imagePullSecrets:
+        - name: ghcr-pull-secret
+      containers:
+        - name: redis-mcp-server
+          image: ghcr.io/yskale/redis-mcp-server:latest
+          ports:
+            - containerPort: 8000
+          env:
+            - name: REDIS_HOST
+              value: "search-redis-master.your-namespace.svc.cluster.local"
+            - name: REDIS_PORT
+              value: "6379"
+            - name: REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: search-redis-secret
+                  key: password
+            - name: REDIS_GRAPH_NAME
+              value: "test"
+          readinessProbe:
+            httpGet:
+              path: /sse
+              port: 8000
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            requests:
+              memory: "256Mi"
+              cpu: "250m"
+            limits:
+              memory: "512Mi"
+              cpu: "500m"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis-mcp-server
+  namespace: your-namespace
+spec:
+  selector:
+    app: redis-mcp-server
+  ports:
+    - port: 8000
+      targetPort: 8000

@@ -1,0 +1,57 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: redis-graph-agent
+  namespace: your-namespace
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: redis-graph-agent
+  template:
+    metadata:
+      labels:
+        app: redis-graph-agent
+    spec:
+      imagePullSecrets:
+        - name: ghcr-pull-secret
+      containers:
+        - name: agent
+          image: ghcr.io/yskale/redis-mcp-server:latest
+          command: ["uvicorn", "agent_api:app", "--host", "0.0.0.0", "--port", "8080"]
+          ports:
+            - containerPort: 8080
+          env:
+            - name: MCP_SERVER_URL
+              value: "http://redis-mcp-server.your-namespace.svc.cluster.local:8000/sse"
+            - name: VLLM_URL
+              value: "http://vllm-server.svc.cluster.local/v1"
+            - name: MODEL
+              value: "google/gemma-3-12b-it"
+            - name: MAX_TOOL_TURNS
+              value: "5"
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          resources:
+            requests:
+              memory: "256Mi"
+              cpu: "250m"
+            limits:
+              memory: "512Mi"
+              cpu: "500m"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis-graph-agent
+  namespace: your-namespace
+spec:
+  selector:
+    app: redis-graph-agent
+  ports:
+    - port: 8080
+      targetPort: 8080
