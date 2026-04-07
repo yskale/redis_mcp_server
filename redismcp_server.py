@@ -771,7 +771,10 @@ def create_sse_app():
     async def asgi_app(scope, receive, send):
         path = scope.get("path", "")
         if scope["type"] == "http":
-            if path == "/sse":
+            if path == "/health":
+                await send({"type": "http.response.start", "status": 200, "headers": [(b"content-type", b"application/json")]})
+                await send({"type": "http.response.body", "body": b'{"status":"ok"}'})
+            elif path == "/sse":
                 async with sse.connect_sse(scope, receive, send) as streams:
                     await app.run(streams[0], streams[1], app.create_initialization_options())
             elif path.startswith("/messages/"):

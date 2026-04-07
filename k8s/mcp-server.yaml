@@ -34,7 +34,7 @@ spec:
               value: "test"
           readinessProbe:
             httpGet:
-              path: /sse
+              path: /health
               port: 8000
             initialDelaySeconds: 5
             periodSeconds: 10
