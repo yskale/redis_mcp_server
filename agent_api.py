@@ -168,9 +168,26 @@ async def run_agent(query: str, system_prompt: str) -> QueryResponse:
         # Handle text-parsed tool calls (Gemma-3 fallback)
         if parsed_text_calls:
             all_results = []
+            # Build a lookup of required args per tool
+            tool_schema = {t["function"]["name"]: t["function"].get("parameters", {}) for t in _openai_tools}
+            # Extract keywords from original query for fallback arg filling
+            user_query = messages[1]["content"] if len(messages) > 1 else ""
+
             for tc in parsed_text_calls:
                 tool_name = tc.get("function") or tc.get("name", "")
                 tool_args = tc.get("parameters") or tc.get("arguments") or {}
+
+                # Fill missing required string args with the user query as best-effort
+                schema = tool_schema.get(tool_name, {})
+                required = schema.get("required", [])
+                props = schema.get("properties", {})
+                for req_arg in required:
+                    if req_arg not in tool_args:
+                        arg_type = props.get(req_arg, {}).get("type", "string")
+                        if arg_type == "string":
+                            tool_args[req_arg] = user_query
+                            log.warning(f"Missing required arg '{req_arg}' for {tool_name}, using query text as fallback")
+
                 log.info(f"Calling tool (text-parsed): {tool_name}({tool_args})")
                 tools_used.append(tool_name)
                 try:
