@@ -11,7 +11,7 @@ metadata:
 spec:
   ingressClassName: nginx
   rules:
-    - host: redis-agent-dev.example.com
+    - host: redis-agent.example.com
       http:
         paths:
           - path: /
@@ -23,8 +23,8 @@ spec:
                   number: 8080
   tls:
     - hosts:
-        - redis-agent-dev.example.com
-      secretName: redis-agent-dev.example.com-tls
+        - redis-agent.example.com
+      secretName: redis-agent.example.com-tls
 ---
 apiVersion: networking.k8s.io/v1
 kind: Ingress
@@ -39,7 +39,7 @@ metadata:
 spec:
   ingressClassName: nginx
   rules:
-    - host: redis-mcp-dev.example.com
+    - host: redis-mcp.example.com
       http:
         paths:
           - path: /
@@ -51,5 +51,5 @@ spec:
                   number: 8000
   tls:
     - hosts:
-        - redis-mcp-dev.example.com
-      secretName: redis-mcp-dev.example.com-tls
+        - redis-mcp.example.com
+      secretName: redis-mcp.example.com-tls
