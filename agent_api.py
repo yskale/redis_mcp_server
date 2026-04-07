@@ -119,8 +119,21 @@ async def run_agent(query: str, system_prompt: str) -> QueryResponse:
 
         msg = response.choices[0].message
 
+        # Gemma-3 sometimes emits tool calls as plain text JSON instead of tool_calls field
+        # Parse them out if tool_calls is empty but content looks like a tool call list
+        parsed_text_calls = []
+        if not msg.tool_calls and msg.content:
+            try:
+                text = msg.content.strip().strip("```json").strip("```").strip()
+                parsed = json.loads(text)
+                if isinstance(parsed, list) and parsed and "function" in parsed[0]:
+                    parsed_text_calls = parsed
+                    log.info(f"Parsed {len(parsed_text_calls)} tool calls from text content")
+            except Exception:
+                pass
+
         # No tool calls — final answer
-        if not msg.tool_calls:
+        if not msg.tool_calls and not parsed_text_calls:
             return QueryResponse(
                 answer=msg.content or "",
                 tools_used=tools_used,
@@ -128,9 +141,11 @@ async def run_agent(query: str, system_prompt: str) -> QueryResponse:
             )
 
         # Execute each tool call against MCP server
-        messages.append(msg.model_dump(exclude_unset=True))
+        if msg.tool_calls:
+            messages.append(msg.model_dump(exclude_unset=True))
 
-        for tc in msg.tool_calls:
+        # Handle standard tool_calls
+        for tc in (msg.tool_calls or []):
             tool_name = tc.function.name
             tool_args: dict[str, Any] = json.loads(tc.function.arguments)
 
@@ -149,6 +164,31 @@ async def run_agent(query: str, system_prompt: str) -> QueryResponse:
                 "tool_call_id": tc.id,
                 "content": content,
             })
+
+        # Handle text-parsed tool calls (Gemma-3 fallback)
+        if parsed_text_calls:
+            all_results = []
+            for tc in parsed_text_calls:
+                tool_name = tc.get("function") or tc.get("name", "")
+                tool_args = tc.get("parameters") or tc.get("arguments") or {}
+                log.info(f"Calling tool (text-parsed): {tool_name}({tool_args})")
+                tools_used.append(tool_name)
+                try:
+                    result = await _mcp_session.call_tool(tool_name, tool_args)
+                    content = result.content[0].text if result.content else "No results"
+                except Exception as e:
+                    content = f"Tool error: {e}"
+                tool_results.append({"tool": tool_name, "args": tool_args, "result": content})
+                all_results.append(f"[{tool_name}]: {content}")
+
+            # Ask model to summarize the results
+            messages.append({"role": "user", "content": "Here are the tool results:\n\n" + "\n\n".join(all_results) + "\n\nPlease summarize the answer."})
+            summary = await llm.chat.completions.create(model=MODEL, messages=messages)
+            return QueryResponse(
+                answer=summary.choices[0].message.content or "",
+                tools_used=tools_used,
+                tool_results=tool_results,
+            )
 
     # Exceeded max turns — return whatever the last message was
     return QueryResponse(
