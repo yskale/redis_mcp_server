@@ -424,33 +424,19 @@ async def list_tools() -> list[Tool]:
             }
         ),
         Tool(
-            name="find_connected_studies",
-            description="Find all studies connected to a concept through StudyVariables",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "concept_id": {
-                        "type": "string",
-                        "description": "Concept ID to search from"
-                    },
-                    "limit": {
-                        "type": "integer",
-                        "description": "Maximum results",
-                        "default": 50
-                    }
-                },
-                "required": ["concept_id"]
-            }
-        ),
-        Tool(
             name="get_concept_connections",
-            description="List all entities directly connected to a concept, showing the relationship type, connected node type, name, and ID for each connection so users can see exactly what is linked and how",
+            description="List all entities directly connected to a concept, showing the relationship type, connected node type, name, and ID. Use node_type_filter to focus on a specific entity type (e.g. only StudyVariables or only Studies).",
             inputSchema={
                 "type": "object",
                 "properties": {
                     "concept_id": {
                         "type": "string",
-                        "description": "Concept ID to analyze"
+                        "description": "Concept ID to analyze (works for any node: disease, phenotype, variable, etc.)"
+                    },
+                    "node_type_filter": {
+                        "type": "string",
+                        "description": "Optional: return only neighbors of this biolink type",
+                        "enum": ["Disease", "PhenotypicFeature", "Procedure", "Cell", "OrganismTaxon", "Study", "StudyVariable", "BiologicalProcess"]
                     },
                     "limit": {
                         "type": "integer",
@@ -495,38 +481,19 @@ async def list_tools() -> list[Tool]:
             }
         ),
         Tool(
-            name="explore_concept_neighborhood",
-            description="Explore the immediate neighborhood of a concept with detailed relationship information",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "concept_id": {
-                        "type": "string",
-                        "description": "Concept ID to explore"
-                    },
-                    "node_type_filter": {
-                        "type": "string",
-                        "description": "Optional: Filter neighbors by type",
-                        "enum": ["Disease", "PhenotypicFeature", "Procedure", "Cell", "OrganismTaxon", "Study", "StudyVariable"]
-                    },
-                    "limit": {
-                        "type": "integer",
-                        "description": "Maximum neighbors to return",
-                        "default": 50
-                    }
-                },
-                "required": ["concept_id"]
-            }
-        ),
-        Tool(
             name="search_variables_by_name",
-            description="Search for StudyVariables directly by name or ID pattern",
+            description=(
+                "Search for StudyVariables by free-text name or by ID prefix/pattern. "
+                "Unlike search_concepts, this searches only StudyVariable nodes and supports "
+                "partial ID matching (e.g. 'phv00430' returns all variables whose ID starts with that prefix). "
+                "Use this when you already know you want variables and have a name fragment or a partial phv ID."
+            ),
             inputSchema={
                 "type": "object",
                 "properties": {
                     "search_term": {
                         "type": "string",
-                        "description": "Variable name or ID pattern to search for (e.g., 'cholesterol', 'phv00')"
+                        "description": "Variable name fragment or ID prefix (e.g., 'asthma', 'phv00430', 'bmi')"
                     },
                     "limit": {
                         "type": "integer",
@@ -535,25 +502,6 @@ async def list_tools() -> list[Tool]:
                     }
                 },
                 "required": ["search_term"]
-            }
-        ),
-        Tool(
-            name="get_variable_details",
-            description="Get detailed information about a specific StudyVariable including all its connections",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "variable_id": {
-                        "type": "string",
-                        "description": "Variable ID (e.g., phv00400480.v1.p1)"
-                    },
-                    "limit": {
-                        "type": "integer",
-                        "description": "Maximum connections to return",
-                        "default": 50
-                    }
-                },
-                "required": ["variable_id"]
             }
         ),
         Tool(
@@ -771,41 +719,22 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             else:
                 return [TextContent(type="text", text=to_json({"concept_id": concept_id, "total_results": 0, "graph": []}))]
 
-        elif name == "find_connected_studies":
-            concept_id = arguments["concept_id"]
-            limit = arguments.get("limit", 50)
-
-            query = f"""
-            MATCH (concept {{id: "{concept_id}"}})--(variable:`biolink.StudyVariable`)--(study:`biolink.Study`)
-            RETURN DISTINCT
-                concept.name AS concept,
-                variable.name AS variable_name,
-                variable.id AS variable_id,
-                study.name AS study_name,
-                study.id AS study_id
-            LIMIT {limit}
-            """
-
-            result = graph.query(query)
-            rows = results_to_list(result.result_set, result.header) if result.result_set else []
-            out = to_json({"concept_id": concept_id, "total_results": len(rows), "studies": rows})
-            if len(out) > 50000:
-                out = out[:50000] + "\n... (truncated)"
-            return [TextContent(type="text", text=out)]
-
         elif name == "get_concept_connections":
             concept_id = arguments["concept_id"]
+            node_type_filter = arguments.get("node_type_filter")
             limit = arguments.get("limit", 50)
 
+            type_clause = f":`biolink.{node_type_filter}`" if node_type_filter else ""
+
             summary_result = graph.query(f"""
-            MATCH (concept {{id: "{concept_id}"}})-[r]-(connected)
+            MATCH (concept {{id: "{concept_id}"}})-[r]-(connected{type_clause})
             WITH labels(connected)[0] AS entity_type, COUNT(*) AS count
             RETURN entity_type, count
             ORDER BY count DESC
             """)
 
             detail_result = graph.query(f"""
-            MATCH (concept {{id: "{concept_id}"}})-[r]-(connected)
+            MATCH (concept {{id: "{concept_id}"}})-[r]-(connected{type_clause})
             RETURN
                 type(r) AS relationship,
                 labels(connected)[0] AS connected_type,
@@ -819,6 +748,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             connections = results_to_list(detail_result.result_set, detail_result.header) if detail_result.result_set else []
             out = to_json({
                 "concept_id": concept_id,
+                "node_type_filter": node_type_filter,
                 "summary": summary,
                 "total_connections_shown": len(connections),
                 "connections": connections,
@@ -870,44 +800,6 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 "variables": rows,
             }))]
 
-        elif name == "explore_concept_neighborhood":
-            concept_id = arguments["concept_id"]
-            node_type_filter = arguments.get("node_type_filter")
-            limit = arguments.get("limit", 50)
-
-            if node_type_filter:
-                query = f"""
-                MATCH (concept {{id: "{concept_id}"}})-[r]-(neighbor:`biolink.{node_type_filter}`)
-                RETURN concept.name AS concept,
-                       type(r) AS relationship,
-                       labels(neighbor)[0] AS neighbor_type,
-                       neighbor.name AS neighbor_name,
-                       neighbor.id AS neighbor_id
-                LIMIT {limit}
-                """
-            else:
-                query = f"""
-                MATCH (concept {{id: "{concept_id}"}})-[r]-(neighbor)
-                RETURN concept.name AS concept,
-                       type(r) AS relationship,
-                       labels(neighbor)[0] AS neighbor_type,
-                       neighbor.name AS neighbor_name,
-                       neighbor.id AS neighbor_id
-                LIMIT {limit}
-                """
-
-            result = graph.query(query)
-            rows = results_to_list(result.result_set, result.header) if result.result_set else []
-            out = to_json({
-                "concept_id": concept_id,
-                "node_type_filter": node_type_filter,
-                "total_results": len(rows),
-                "neighbors": rows,
-            })
-            if len(out) > 50000:
-                out = out[:50000] + "\n... (truncated)"
-            return [TextContent(type="text", text=out)]
-
         elif name == "search_variables_by_name":
             search_term = arguments["search_term"]
             limit = arguments.get("limit", 20)
@@ -922,30 +814,6 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             result = graph.query(query)
             rows = results_to_list(result.result_set, result.header) if result.result_set else []
             out = to_json({"search_term": search_term, "total_results": len(rows), "variables": rows})
-            if len(out) > 50000:
-                out = out[:50000] + "\n... (truncated)"
-            return [TextContent(type="text", text=out)]
-
-        elif name == "get_variable_details":
-            variable_id = arguments["variable_id"]
-            limit = arguments.get("limit", 50)
-
-            query = f"""
-            MATCH (v:`biolink.StudyVariable` {{id: "{variable_id}"}})
-            OPTIONAL MATCH (v)-[r]-(connected)
-            RETURN
-                v.id AS variable_id,
-                v.name AS variable_name,
-                type(r) AS relationship,
-                labels(connected)[0] AS connected_type,
-                connected.name AS connected_name,
-                connected.id AS connected_id
-            LIMIT {limit}
-            """
-
-            result = graph.query(query)
-            rows = results_to_list(result.result_set, result.header) if result.result_set else []
-            out = to_json({"variable_id": variable_id, "total_connections": len(rows), "details": rows})
             if len(out) > 50000:
                 out = out[:50000] + "\n... (truncated)"
             return [TextContent(type="text", text=out)]
