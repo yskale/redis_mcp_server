@@ -1,34 +1,37 @@
 # Redis Graph MCP Server
 
-A [Model Context Protocol (MCP)](https://modelcontextprotocol.io) server for querying a biomedical knowledge graph stored in Redis (RedisGraph). Supports both stdio (Claude Desktop) and SSE (HTTP) transports.
+A [Model Context Protocol (MCP)](https://modelcontextprotocol.io) server for querying a biomedical knowledge graph stored in Redis (RedisGraph). Supports both **stdio** (Claude Desktop) and **SSE** (HTTP) transports.
 
-## Deployed Endpoints (Kubernetes)
+## Overview
 
-| Service | URL |
-|---|---|
-| Agent API (Swagger UI) | https://redis-agent.example.com/docs |
-| Agent API (query) | https://redis-agent.example.com/query |
-| MCP Server (SSE) | https://redis-mcp.example.com/sse |
-| MCP Server (health) | https://redis-mcp.example.com/health |
+This server exposes a biomedical knowledge graph as MCP tools and prompts, enabling LLMs and AI agents to:
+
+- Search for diseases, phenotypes, and other biomedical concepts by name
+- Enrich searches with synonyms using [Name Resolution SRI](https://name-resolution-sri.renci.org) and [SAP-BERT](https://github.com/cambridgeltl/sapbert)
+- Discover study variables connected to a concept across research datasets
+- Traverse concept relationships and find paths between entities
+- Execute raw Cypher queries for advanced use cases
 
 ## Architecture
 
 ```
-User / Claude Desktop
-        │
-        ▼
-redis-graph-agent  (port 8080)
-  - Accepts natural language queries
-  - Uses Gemma-3 via vLLM for reasoning
-        │
-        ▼
-redis-mcp-server  (port 8000)
-  - Exposes Redis graph tools via MCP/SSE
-  - Synonym enrichment via Name Resolution SRI + SAP-BERT
-        │
-        ▼
-search-redis-master  (namespace: your-namespace)
+User / Claude Desktop / API Client
+            │
+            ▼
+    redis-graph-agent  (port 8080)
+      - REST API for natural language queries
+      - LLM reasoning via vLLM (tool-calling mode)
+            │
+            ▼
+    redis-mcp-server  (port 8000)
+      - MCP tools and prompts over SSE
+      - Synonym enrichment via Name Resolution SRI + SAP-BERT
+            │
+            ▼
+        Redis (RedisGraph)
 ```
+
+---
 
 ## Using with Claude Desktop
 
@@ -38,7 +41,7 @@ Add to `~/Library/Application Support/Claude/claude_desktop_config.json`:
 {
   "mcpServers": {
     "redis-graph": {
-      "url": "https://redis-mcp.example.com/sse"
+      "url": "http://localhost:8000/sse"
     }
   }
 }
@@ -46,16 +49,18 @@ Add to `~/Library/Application Support/Claude/claude_desktop_config.json`:
 
 Restart Claude Desktop after updating the config.
 
+---
+
 ## Using the Agent API
 
 ### Via Swagger UI
 
-Open https://redis-agent.example.com/docs in your browser.
+Navigate to `/docs` on the running agent service.
 
 ### Via curl
 
 ```bash
-curl -X POST https://redis-agent.example.com/query \
+curl -X POST http://localhost:8080/query \
   -H "Content-Type: application/json" \
   -d '{"query": "find study variables related to asthma"}'
 ```
@@ -68,6 +73,16 @@ curl -X POST https://redis-agent.example.com/query \
 | `max_results` | int | 20 | Max results per tool call |
 | `system_prompt` | string | built-in | Override the system prompt |
 
+### Response
+
+```json
+{
+  "answer": "Found 20 study variables related to asthma...",
+  "tools_used": ["search_concepts"],
+  "tool_results": [...]
+}
+```
+
 ---
 
 ## Available Tools
@@ -78,158 +93,118 @@ All tools return JSON. Below is each tool, what it does, and a concrete example.
 
 ### `search_concepts`
 
-Search for biomedical concepts by name, or find study variables related to a concept with automatic synonym enrichment.
+Search for biomedical concepts by name, or find study variables related to a concept with **automatic synonym enrichment**.
 
-When `find_variables=true`, the term is expanded via **Name Resolution SRI** and **SAP-BERT** (up to 10 results each), then the combined CURIEs and labels are used to search for connected `StudyVariable` nodes.
+When `find_variables=true`, the term is expanded via Name Resolution SRI and SAP-BERT (up to 10 results each). The combined CURIEs and labels are then used to search the graph for connected `StudyVariable` nodes — providing broader coverage than a simple name match.
 
-**Example — find concepts:**
+**Find concepts by name:**
 ```json
-{
-  "search_term": "asthma",
-  "find_variables": false
-}
-```
-```json
-{
-  "search_term": "asthma",
-  "node_type": "Disease",
-  "find_variables": false
-}
+{ "search_term": "asthma" }
 ```
 
-**Example — find variables with synonym enrichment:**
+**Filter by node type:**
 ```json
-{
-  "search_term": "asthma",
-  "find_variables": true,
-  "limit": 20
-}
+{ "search_term": "asthma", "node_type": "Disease" }
 ```
-Returns variables like `asthma_hospital_Yes12mo`, `esp_asthma_status_baseline` linked via 17 matched synonyms (MONDO:0004979, EFO:1002011, UMLS:C0581126, ...).
+
+**Find variables with synonym enrichment:**
+```json
+{ "search_term": "asthma", "find_variables": true, "limit": 20 }
+```
 
 ---
 
 ### `get_concept_graph`
 
-Get the subgraph around a concept. At depth 1, returns all directly connected nodes of any type. At depth 2, traverses concept → StudyVariable → Study and includes how many other concepts each variable is linked to.
+Get the subgraph around a concept.
 
-**Example — explore direct neighbors:**
+- **Depth 1** — returns all directly connected nodes of any type
+- **Depth 2** — traverses concept → StudyVariable → Study, with a count of how many other concepts each variable links to
+
+**Direct neighbors:**
 ```json
-{
-  "concept_id": "MONDO:0004979",
-  "expand_depth": 1
-}
+{ "concept_id": "MONDO:0004979", "expand_depth": 1 }
 ```
 
-**Example — get variables and studies:**
+**Variables and studies:**
 ```json
-{
-  "concept_id": "MONDO:0004979",
-  "expand_depth": 2,
-  "limit": 50
-}
+{ "concept_id": "MONDO:0004979", "expand_depth": 2, "limit": 50 }
 ```
 
 ---
 
 ### `get_concept_connections`
 
-List every entity directly connected to a concept — including relationship type, node type, name, and ID. Returns a summary (count per entity type) plus the full list of leaf nodes. Optionally filter by node type.
+List every entity directly connected to a node — relationship type, node type, name, and ID. Returns a type-count summary plus the full leaf-node list. Also works with variable IDs. Optionally filter by node type.
 
-**Example — all connections:**
+**All connections:**
 ```json
-{
-  "concept_id": "MONDO:0004979"
-}
+{ "concept_id": "MONDO:0004979" }
 ```
 
-**Example — only connected studies:**
+**Only connected studies:**
 ```json
-{
-  "concept_id": "MONDO:0004979",
-  "node_type_filter": "Study"
-}
+{ "concept_id": "MONDO:0004979", "node_type_filter": "Study" }
 ```
 
-**Example — only connected variables:**
+**Only connected variables:**
 ```json
-{
-  "concept_id": "MONDO:0004979",
-  "node_type_filter": "StudyVariable"
-}
+{ "concept_id": "MONDO:0004979", "node_type_filter": "StudyVariable" }
 ```
 
-Also works with variable IDs to inspect a variable's connections:
+**Inspect a variable's connections:**
 ```json
-{
-  "concept_id": "phv00430345.v1.p1"
-}
+{ "concept_id": "phv00430345.v1.p1" }
 ```
 
 ---
 
 ### `search_variables_by_name`
 
-Search for `StudyVariable` nodes by free-text name fragment or by partial phv ID. Unlike `search_concepts`, this targets only variables and supports ID prefix matching.
+Search for `StudyVariable` nodes by name fragment or by partial ID. Unlike `search_concepts`, this targets only variables and supports ID prefix matching.
 
-**Example — search by name fragment:**
+**By name fragment:**
 ```json
-{
-  "search_term": "bmi"
-}
+{ "search_term": "bmi" }
 ```
 
-**Example — search by partial phv ID:**
+**By partial phv ID:**
 ```json
-{
-  "search_term": "phv00430"
-}
+{ "search_term": "phv00430" }
 ```
 
 ---
 
 ### `find_highly_connected_variables`
 
-Find `StudyVariable` nodes with the most connections to biomedical concepts — useful for discovering which variables are the most broadly relevant across disease areas.
+Find `StudyVariable` nodes with the most connections to biomedical concepts — useful for discovering the most broadly relevant variables across disease areas.
 
-**Example:**
 ```json
-{
-  "min_connections": 5,
-  "limit": 20
-}
+{ "min_connections": 5, "limit": 20 }
 ```
 
 ---
 
 ### `expand_concept`
 
-Traverse the concept graph N hops from a starting concept, returning related concepts with hop distance and path relationship types. Optionally filter by relationship type.
+Traverse the concept graph N hops from a starting node, returning related concepts with hop distance and path relationship types. Optionally filter by relationship type.
 
-**Example — find all concepts within 2 hops:**
+**All related concepts within 2 hops:**
 ```json
-{
-  "concept_id": "MONDO:0004979",
-  "max_hops": 2
-}
+{ "concept_id": "MONDO:0004979", "max_hops": 2 }
 ```
 
-**Example — only `related_to` relationships:**
+**Filter by relationship type:**
 ```json
-{
-  "concept_id": "MONDO:0004979",
-  "max_hops": 2,
-  "relationship_types": ["related_to"]
-}
+{ "concept_id": "MONDO:0004979", "max_hops": 2, "relationship_types": ["related_to"] }
 ```
 
 ---
 
 ### `find_concept_paths`
 
-Find the shortest path(s) between two biomedical concepts through the knowledge graph.
+Find the shortest path(s) between two biomedical concepts.
 
-**Example:**
 ```json
 {
   "source_id": "MONDO:0004979",
@@ -237,33 +212,31 @@ Find the shortest path(s) between two biomedical concepts through the knowledge 
   "max_path_length": 3
 }
 ```
-Returns node names and relationship types along each path.
+
+Returns the node names and relationship types along each path.
 
 ---
 
 ### `list_graph_schema`
 
-List all node types in the graph with counts. Essential first step for any LLM to understand what data is available.
+List all node types in the graph with counts. Recommended as a first step for any LLM to understand what data is available.
 
-**Example:**
 ```json
-{
-  "show_counts": true
-}
+{ "show_counts": true }
 ```
 
 ---
 
 ### `cypher_query`
 
-Execute a raw Cypher query directly against RedisGraph. Use backticks for biolink labels with dots.
+Execute a raw Cypher query directly against RedisGraph. Use backticks for biolink labels containing dots.
 
-**Example — count all diseases:**
+**Count all diseases:**
 ```cypher
 MATCH (n:`biolink.Disease`) RETURN COUNT(n)
 ```
 
-**Example — find concepts connected to a variable:**
+**Find concepts connected to a variable:**
 ```cypher
 MATCH (v:`biolink.StudyVariable` {id: "phv00430345.v1.p1"})--(c)
 RETURN labels(c)[0] AS type, c.name AS name, c.id AS id
@@ -276,38 +249,22 @@ LIMIT 20
 
 When connected via Claude Desktop or another MCP client, these prompts appear as guided workflows:
 
-| Prompt | Arguments | What it does |
+| Prompt | Arguments | Description |
 |---|---|---|
-| `find_variables_for_concept` | `concept` | Synonym-enriched variable search |
-| `explore_concept` | `concept_id` | Full concept exploration (connections + studies + subgraph) |
-| `find_studies_for_disease` | `disease_name` | End-to-end: disease name → studies |
-| `explain_variable` | `variable_id` | Plain-language explanation of a variable |
+| `find_variables_for_concept` | `concept` | Synonym-enriched search for study variables |
+| `explore_concept` | `concept_id` | Full exploration: connections, studies, subgraph |
+| `find_studies_for_disease` | `disease_name` | End-to-end: disease name → matching studies |
+| `explain_variable` | `variable_id` | Plain-language explanation of what a variable measures |
 | `find_path_between_concepts` | `concept_a_id`, `concept_b_id` | Relationship path between two concepts |
 
 ---
-
-## Kubernetes Deployment
-
-```bash
-# Deploy
-kubectl apply -f k8s/mcp-server.yaml
-kubectl apply -f k8s/agent.yaml
-kubectl apply -f k8s/ingress.yaml
-
-# Restart (pull new image)
-kubectl rollout restart deployment/redis-mcp-server deployment/redis-graph-agent -n your-namespace
-
-# Check status
-kubectl get pods -n your-namespace -l 'app in (redis-mcp-server,redis-graph-agent)'
-```
 
 ## Local Development
 
 ### Prerequisites
 
 - Python 3.12+
-- Redis with RedisGraph module
-- `kubectl` access to `your-namespace` namespace
+- Redis with RedisGraph module running locally
 
 ### Installation
 
@@ -315,44 +272,70 @@ kubectl get pods -n your-namespace -l 'app in (redis-mcp-server,redis-graph-agen
 pip install -r requirements.txt
 ```
 
-### Port-forward Redis
+### Run MCP server (stdio mode)
 
 ```bash
-kubectl port-forward -n your-namespace svc/search-redis-master 6379:6379
-```
-
-### Run MCP server locally (stdio)
-
-```bash
-REDIS_HOST=localhost REDIS_PORT=6379 REDIS_PASSWORD=<password> REDIS_GRAPH_NAME=test \
+REDIS_HOST=localhost \
+REDIS_PORT=6379 \
+REDIS_PASSWORD=<password> \
+REDIS_GRAPH_NAME=<graph_name> \
   python3 redismcp_server.py
 ```
 
-### Run MCP server locally (SSE)
+### Run MCP server (SSE mode)
 
 ```bash
-REDIS_HOST=localhost REDIS_PORT=6379 REDIS_PASSWORD=<password> REDIS_GRAPH_NAME=test \
+REDIS_HOST=localhost \
+REDIS_PORT=6379 \
+REDIS_PASSWORD=<password> \
+REDIS_GRAPH_NAME=<graph_name> \
   python3 redismcp_server.py --transport sse --port 8000
 ```
 
-### Run agent locally
+### Run agent
 
 ```bash
 MCP_SERVER_URL=http://localhost:8000/sse \
-VLLM_URL=http://vllm-server.svc.cluster.local/v1 \
-MODEL=google/gemma-3-12b-it \
+VLLM_URL=<your_vllm_endpoint>/v1 \
+MODEL=<model_name> \
   uvicorn agent_api:app --host 0.0.0.0 --port 8080
 ```
 
+---
+
+## Kubernetes Deployment
+
+```bash
+# Deploy all services
+kubectl apply -f k8s/mcp-server.yaml
+kubectl apply -f k8s/agent.yaml
+kubectl apply -f k8s/ingress.yaml
+
+# Restart pods to pull a new image
+kubectl rollout restart deployment/redis-mcp-server deployment/redis-graph-agent -n <namespace>
+
+# Check pod status
+kubectl get pods -n <namespace> -l 'app in (redis-mcp-server,redis-graph-agent)'
+```
+
+---
+
 ## Configuration
 
-| Variable | Default | Description |
-|---|---|---|
-| `REDIS_HOST` | `localhost` | Redis host |
-| `REDIS_PORT` | `6379` | Redis port |
-| `REDIS_PASSWORD` | _(required)_ | Redis auth password |
-| `REDIS_GRAPH_NAME` | `test` | RedisGraph graph name |
-| `MCP_SERVER_URL` | _(required)_ | MCP server URL (agent only) |
-| `VLLM_URL` | _(required)_ | vLLM endpoint (agent only) |
-| `MODEL` | _(required)_ | LLM model name (agent only) |
-| `MAX_TOOL_TURNS` | `5` | Max tool call iterations per query |
+### MCP Server
+
+| Variable | Description |
+|---|---|
+| `REDIS_HOST` | Redis hostname |
+| `REDIS_PORT` | Redis port |
+| `REDIS_PASSWORD` | Redis auth password |
+| `REDIS_GRAPH_NAME` | RedisGraph graph name |
+
+### Agent
+
+| Variable | Description |
+|---|---|
+| `MCP_SERVER_URL` | SSE endpoint of the MCP server (e.g. `http://redis-mcp-server:8000/sse`) |
+| `VLLM_URL` | vLLM OpenAI-compatible endpoint |
+| `MODEL` | LLM model name served by vLLM |
+| `MAX_TOOL_TURNS` | Max tool call iterations per query (default: `5`) |
