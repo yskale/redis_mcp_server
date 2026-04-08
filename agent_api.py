@@ -28,10 +28,13 @@ log = logging.getLogger(__name__)
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
-MCP_SERVER_URL = os.getenv("MCP_SERVER_URL", "http://redis-mcp-server:8000/sse")
-VLLM_URL       = os.getenv("VLLM_URL", "http://vllm-server.svc.cluster.local/v1")
-MODEL          = os.getenv("MODEL", "google/gemma-3-12b-it")
+MCP_SERVER_URL = os.getenv("MCP_SERVER_URL")
+VLLM_URL       = os.getenv("VLLM_URL")
+MODEL          = os.getenv("MODEL")
 MAX_TOOL_TURNS = int(os.getenv("MAX_TOOL_TURNS", "5"))
+
+if not MCP_SERVER_URL or not VLLM_URL or not MODEL:
+    raise RuntimeError("MCP_SERVER_URL, VLLM_URL, and MODEL environment variables are required")
 
 # ── MCP session (kept alive for lifetime of app) ──────────────────────────────
 
