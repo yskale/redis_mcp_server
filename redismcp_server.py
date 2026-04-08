@@ -462,17 +462,22 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 curie_list = ", ".join(f'"{c}"' for c in curies) if curies else None
                 label_list = ", ".join(f'"{l}"' for l in labels) if labels else None
 
-                # Match concept by enriched CURIEs, enriched labels, or original search term
-                where_clauses = [f"concept.name CONTAINS '{search_term}'"]
+                # Match concept by enriched CURIEs or enriched labels (no raw CONTAINS —
+                # that would match StudyVariable nodes like "activeasthma" as concepts)
+                where_clauses = []
                 if curie_list:
                     where_clauses.append(f"concept.id IN [{curie_list}]")
                 if label_list:
                     where_clauses.append(f"concept.name IN [{label_list}]")
+                if not where_clauses:
+                    # Fallback only when both services returned nothing
+                    where_clauses.append(f"concept.name CONTAINS '{search_term}'")
                 where_expr = " OR ".join(where_clauses)
 
                 query = f"""
                 MATCH (concept)-[*1..2]-(v:`biolink.StudyVariable`)
-                WHERE {where_expr}
+                WHERE ({where_expr})
+                  AND NOT labels(concept)[0] = 'biolink.StudyVariable'
                 RETURN DISTINCT
                     labels(concept)[0] AS concept_type,
                     concept.id AS concept_id,
@@ -484,8 +489,8 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 result = graph.query(query)
 
                 enrichment_summary = (
-                    f"Synonym enrichment: {len(curies)} CURIEs from Name Resolution SRI, "
-                    f"{len(labels)} labels from SAP-BERT.\n"
+                    f"Synonym enrichment (Name Resolution SRI + SAP-BERT): "
+                    f"{len(curies)} unique CURIEs, {len(labels)} unique labels.\n"
                     f"CURIEs: {', '.join(curies[:5])}{'...' if len(curies) > 5 else ''}\n"
                     f"Labels: {', '.join(labels[:5])}{'...' if len(labels) > 5 else ''}\n\n"
                 )
