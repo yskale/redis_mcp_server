@@ -15,7 +15,10 @@ import httpx
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp.server.sse import SseServerTransport
-from mcp.types import Tool, TextContent
+from mcp.types import (
+    Tool, TextContent,
+    Prompt, PromptArgument, PromptMessage, GetPromptResult,
+)
 from dotenv import load_dotenv
 import uvicorn
 
@@ -88,6 +91,224 @@ async def fetch_synonyms(search_term: str) -> dict:
         "curies": list(dict.fromkeys(curies)),   # deduplicate, preserve order
         "labels": list(dict.fromkeys(labels)),
     }
+
+
+@app.list_prompts()
+async def list_prompts() -> list[Prompt]:
+    """Expose reusable workflow prompts for chatbots and LLM clients."""
+    return [
+        Prompt(
+            name="find_variables_for_concept",
+            description=(
+                "Find study variables in the BDC knowledge graph related to a biomedical concept. "
+                "Enriches the concept with synonyms from Name Resolution SRI and SAP-BERT, "
+                "then searches for connected study variables."
+            ),
+            arguments=[
+                PromptArgument(
+                    name="concept",
+                    description="Biomedical concept to search for (e.g. 'asthma', 'diabetes', 'cholesterol')",
+                    required=True,
+                )
+            ],
+        ),
+        Prompt(
+            name="explore_concept",
+            description=(
+                "Get a full picture of a concept in the knowledge graph: what entities are connected to it, "
+                "which studies have measured it, and what variables are associated with it."
+            ),
+            arguments=[
+                PromptArgument(
+                    name="concept_id",
+                    description="Concept CURIE identifier (e.g. 'MONDO:0004979' for asthma)",
+                    required=True,
+                )
+            ],
+        ),
+        Prompt(
+            name="find_studies_for_disease",
+            description=(
+                "End-to-end workflow: given a disease or phenotype name, find all studies in the BDC "
+                "knowledge graph that have collected data related to it, via synonym-enriched concept lookup."
+            ),
+            arguments=[
+                PromptArgument(
+                    name="disease_name",
+                    description="Disease or phenotype name (e.g. 'asthma', 'hypertension')",
+                    required=True,
+                )
+            ],
+        ),
+        Prompt(
+            name="explain_variable",
+            description=(
+                "Explain what a study variable measures and its full biomedical context: "
+                "which concepts it is linked to and which studies it belongs to."
+            ),
+            arguments=[
+                PromptArgument(
+                    name="variable_id",
+                    description="Study variable identifier (e.g. 'phv00430345.v1.p1')",
+                    required=True,
+                )
+            ],
+        ),
+        Prompt(
+            name="find_path_between_concepts",
+            description=(
+                "Discover how two biomedical concepts are related to each other through the knowledge graph "
+                "and explain the connection path in plain language."
+            ),
+            arguments=[
+                PromptArgument(
+                    name="concept_a_id",
+                    description="First concept CURIE (e.g. 'MONDO:0004979')",
+                    required=True,
+                ),
+                PromptArgument(
+                    name="concept_b_id",
+                    description="Second concept CURIE (e.g. 'MONDO:0004784')",
+                    required=True,
+                ),
+            ],
+        ),
+    ]
+
+
+@app.get_prompt()
+async def get_prompt(name: str, arguments: dict) -> GetPromptResult:
+    """Return the message template for the requested prompt."""
+
+    if name == "find_variables_for_concept":
+        concept = arguments.get("concept", "")
+        return GetPromptResult(
+            description=f"Find study variables related to '{concept}'",
+            messages=[
+                PromptMessage(
+                    role="user",
+                    content=TextContent(
+                        type="text",
+                        text=(
+                            f"I want to find study variables in the BDC biomedical knowledge graph "
+                            f"related to the concept '{concept}'.\n\n"
+                            f"Please use the `search_concepts` tool with:\n"
+                            f"  - search_term: \"{concept}\"\n"
+                            f"  - find_variables: true\n\n"
+                            f"This will automatically enrich '{concept}' with synonyms from "
+                            f"Name Resolution SRI and SAP-BERT before searching.\n\n"
+                            f"Once you have the results, summarize:\n"
+                            f"1. How many synonyms were found and what they are\n"
+                            f"2. How many study variables were matched\n"
+                            f"3. The most relevant variables and which concepts linked them"
+                        ),
+                    ),
+                )
+            ],
+        )
+
+    elif name == "explore_concept":
+        concept_id = arguments.get("concept_id", "")
+        return GetPromptResult(
+            description=f"Explore all connections for concept '{concept_id}'",
+            messages=[
+                PromptMessage(
+                    role="user",
+                    content=TextContent(
+                        type="text",
+                        text=(
+                            f"Explore the biomedical concept '{concept_id}' in the knowledge graph.\n\n"
+                            f"Please run these tools in order:\n"
+                            f"1. `get_concept_connections` with concept_id='{concept_id}' — to see all directly connected entities\n"
+                            f"2. `find_connected_studies` with concept_id='{concept_id}' — to find studies that have measured this concept\n"
+                            f"3. `get_concept_graph` with concept_id='{concept_id}' — for the full subgraph\n\n"
+                            f"Then provide a clear summary:\n"
+                            f"- What is this concept and what types of entities are connected to it?\n"
+                            f"- How many study variables and studies are linked?\n"
+                            f"- What are the most notable connections?"
+                        ),
+                    ),
+                )
+            ],
+        )
+
+    elif name == "find_studies_for_disease":
+        disease_name = arguments.get("disease_name", "")
+        return GetPromptResult(
+            description=f"Find studies that collected data on '{disease_name}'",
+            messages=[
+                PromptMessage(
+                    role="user",
+                    content=TextContent(
+                        type="text",
+                        text=(
+                            f"I want to find all studies in the BDC knowledge graph that have collected "
+                            f"data related to '{disease_name}'.\n\n"
+                            f"Step 1: Use `search_concepts` with search_term='{disease_name}' and find_variables=true "
+                            f"to get synonym-enriched study variables.\n\n"
+                            f"Step 2: For each unique concept_id returned, use `find_connected_studies` "
+                            f"to get the full list of studies.\n\n"
+                            f"Finally, summarize:\n"
+                            f"- Which synonyms were matched in the graph\n"
+                            f"- The complete list of studies found\n"
+                            f"- How many unique variables and studies are available for '{disease_name}'"
+                        ),
+                    ),
+                )
+            ],
+        )
+
+    elif name == "explain_variable":
+        variable_id = arguments.get("variable_id", "")
+        return GetPromptResult(
+            description=f"Explain study variable '{variable_id}'",
+            messages=[
+                PromptMessage(
+                    role="user",
+                    content=TextContent(
+                        type="text",
+                        text=(
+                            f"Please explain the study variable '{variable_id}' in plain language.\n\n"
+                            f"Use `get_variable_details` with variable_id='{variable_id}' to retrieve its details.\n\n"
+                            f"Then explain:\n"
+                            f"1. What does this variable measure or represent?\n"
+                            f"2. Which biomedical concepts is it linked to (diseases, phenotypes, procedures)?\n"
+                            f"3. Which study does it belong to?\n"
+                            f"4. How might a researcher use this variable in a study?"
+                        ),
+                    ),
+                )
+            ],
+        )
+
+    elif name == "find_path_between_concepts":
+        concept_a = arguments.get("concept_a_id", "")
+        concept_b = arguments.get("concept_b_id", "")
+        return GetPromptResult(
+            description=f"Find relationship path between '{concept_a}' and '{concept_b}'",
+            messages=[
+                PromptMessage(
+                    role="user",
+                    content=TextContent(
+                        type="text",
+                        text=(
+                            f"Discover how the concepts '{concept_a}' and '{concept_b}' are related "
+                            f"in the biomedical knowledge graph.\n\n"
+                            f"Use `find_concept_paths` with source_id='{concept_a}' and target_id='{concept_b}'.\n\n"
+                            f"If no direct path is found, also try `expand_concept` on each to find "
+                            f"shared neighbors.\n\n"
+                            f"Then explain in plain language:\n"
+                            f"1. Are these concepts directly or indirectly related?\n"
+                            f"2. What is the relationship path between them?\n"
+                            f"3. What does this connection mean biomedically?"
+                        ),
+                    ),
+                )
+            ],
+        )
+
+    else:
+        raise ValueError(f"Unknown prompt: {name}")
 
 
 def get_redis_connection():
