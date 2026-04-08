@@ -10,12 +10,16 @@ import argparse
 import redis
 from redis.commands.graph import Graph
 
+import httpx
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp.server.sse import SseServerTransport
 from mcp.types import Tool, TextContent
 from dotenv import load_dotenv
 import uvicorn
+
+NAME_RESOLUTION_URL = "https://name-resolution-sri.renci.org/lookup"
+SAP_QDRANT_URL = "https://sap-qdrant.example.com/annotate/"
 
 # Load environment variables from .env file
 load_dotenv()
@@ -25,6 +29,64 @@ app = Server("redis-graph-server")
 # Redis connection pool (initialized on first use)
 redis_client = None
 graph_db = None
+
+
+async def fetch_synonyms(search_term: str) -> dict:
+    """
+    Enrich a search term by fetching synonyms and related concept identifiers from:
+    - Name Resolution SRI: returns normalized CURIEs and preferred labels
+    - SAP-BERT Qdrant: returns semantically similar biomedical concepts
+
+    Returns {'curies': [...], 'labels': [...]} with up to 10 results from each source.
+    """
+    curies = []
+    labels = []
+
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        nr_coro = client.get(NAME_RESOLUTION_URL, params={"string": search_term, "limit": 10})
+        sap_coro = client.post(
+            SAP_QDRANT_URL,
+            json={"text": search_term, "model_name": "sapbert", "count": 10, "args": {}}
+        )
+        nr_resp, sap_resp = await asyncio.gather(nr_coro, sap_coro, return_exceptions=True)
+
+    # Name Resolution SRI: [{curie, label, synonyms, ...}, ...]
+    if not isinstance(nr_resp, Exception) and nr_resp.status_code == 200:
+        try:
+            for item in nr_resp.json()[:10]:
+                if curie := item.get("curie"):
+                    curies.append(curie)
+                if label := item.get("label"):
+                    labels.append(label)
+        except Exception:
+            pass
+
+    # SAP-BERT Qdrant: response structure varies; handle list or wrapped dict
+    if not isinstance(sap_resp, Exception) and sap_resp.status_code == 200:
+        try:
+            sap_data = sap_resp.json()
+            items = sap_data if isinstance(sap_data, list) else (
+                sap_data.get("results") or sap_data.get("hits") or
+                sap_data.get("annotations") or sap_data.get("concepts") or []
+            )
+            for item in items[:10]:
+                if not isinstance(item, dict):
+                    continue
+                for id_field in ("id", "curie", "identifier", "concept_id"):
+                    if val := item.get(id_field):
+                        curies.append(val)
+                        break
+                for name_field in ("name", "label", "text", "concept_name"):
+                    if val := item.get(name_field):
+                        labels.append(val)
+                        break
+        except Exception:
+            pass
+
+    return {
+        "curies": list(dict.fromkeys(curies)),   # deduplicate, preserve order
+        "labels": list(dict.fromkeys(labels)),
+    }
 
 
 def get_redis_connection():
@@ -80,7 +142,15 @@ async def list_tools() -> list[Tool]:
         ),
         Tool(
             name="search_concepts",
-            description="Search for biomedical concepts by name (diseases, phenotypes, procedures, etc.) OR find variables related to a concept",
+            description=(
+                "Search for biomedical concepts by name, OR find StudyVariables related to a concept with synonym enrichment. "
+                "When find_variables=true, the search term is first expanded into synonyms and related concept identifiers "
+                "by querying two external services in parallel: "
+                "(1) Name Resolution SRI (https://name-resolution-sri.renci.org) — returns up to 10 normalized CURIEs and preferred labels; "
+                "(2) SAP-BERT Qdrant (https://sap-qdrant.example.com) — returns up to 10 semantically similar biomedical concepts. "
+                "The combined set of CURIEs and labels is then used to search the Redis knowledge graph for any StudyVariables "
+                "connected to those concepts, providing broader coverage than a simple name match."
+            ),
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -95,7 +165,7 @@ async def list_tools() -> list[Tool]:
                     },
                     "find_variables": {
                         "type": "boolean",
-                        "description": "Set to true to find StudyVariables connected to the concept instead of the concept itself",
+                        "description": "Set to true to enrich the search term with synonyms via Name Resolution SRI and SAP-BERT, then find StudyVariables connected to those concepts in the Redis graph",
                         "default": False
                     },
                     "limit": {
@@ -382,13 +452,30 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             find_variables = arguments.get("find_variables", False)
             limit = arguments.get("limit", 20)
 
-            # If user wants variables related to a concept
+            # If user wants variables related to a concept — enrich with synonyms first
             if find_variables:
+                synonyms = await fetch_synonyms(search_term)
+                curies = synonyms["curies"]
+                labels = synonyms["labels"]
+
+                # Build Cypher IN-list strings (quoted, comma-separated)
+                curie_list = ", ".join(f'"{c}"' for c in curies) if curies else None
+                label_list = ", ".join(f'"{l}"' for l in labels) if labels else None
+
+                # Match concept by enriched CURIEs, enriched labels, or original search term
+                where_clauses = [f"concept.name CONTAINS '{search_term}'"]
+                if curie_list:
+                    where_clauses.append(f"concept.id IN [{curie_list}]")
+                if label_list:
+                    where_clauses.append(f"concept.name IN [{label_list}]")
+                where_expr = " OR ".join(where_clauses)
+
                 query = f"""
                 MATCH (concept)-[*1..2]-(v:`biolink.StudyVariable`)
-                WHERE concept.name CONTAINS '{search_term}'
+                WHERE {where_expr}
                 RETURN DISTINCT
                     labels(concept)[0] AS concept_type,
+                    concept.id AS concept_id,
                     concept.name AS concept_name,
                     v.name AS variable_name,
                     v.id AS variable_id
@@ -396,17 +483,29 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 """
                 result = graph.query(query)
 
+                enrichment_summary = (
+                    f"Synonym enrichment: {len(curies)} CURIEs from Name Resolution SRI, "
+                    f"{len(labels)} labels from SAP-BERT.\n"
+                    f"CURIEs: {', '.join(curies[:5])}{'...' if len(curies) > 5 else ''}\n"
+                    f"Labels: {', '.join(labels[:5])}{'...' if len(labels) > 5 else ''}\n\n"
+                )
+
                 if result.result_set and len(result.result_set) > 0:
                     formatted = format_query_results(result.result_set, result.header)
                     result_count = len(result.result_set)
-                    response_text = f"Found {result_count} variables related to '{search_term}':\n\n{formatted}"
-
+                    response_text = (
+                        f"Found {result_count} variables related to '{search_term}' "
+                        f"(including synonyms):\n\n"
+                        + enrichment_summary + formatted
+                    )
                     if len(response_text) > 50000:
                         response_text = response_text[:50000] + f"\n\n... (truncated, showing first portion of {result_count} results)"
-
                     return [TextContent(type="text", text=response_text)]
                 else:
-                    return [TextContent(type="text", text=f"No variables found related to '{search_term}'")]
+                    return [TextContent(type="text", text=
+                        f"No variables found related to '{search_term}' (including synonyms).\n\n"
+                        + enrichment_summary
+                    )]
 
             # Otherwise search for concepts by name
             else:
