@@ -222,13 +222,18 @@ async def list_tools() -> list[Tool]:
         ),
         Tool(
             name="get_concept_connections",
-            description="Count and list what types of entities are connected to a concept",
+            description="List all entities directly connected to a concept, showing the relationship type, connected node type, name, and ID for each connection so users can see exactly what is linked and how",
             inputSchema={
                 "type": "object",
                 "properties": {
                     "concept_id": {
                         "type": "string",
                         "description": "Concept ID to analyze"
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Maximum number of connections to return",
+                        "default": 50
                     }
                 },
                 "required": ["concept_id"]
@@ -612,19 +617,47 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         
         elif name == "get_concept_connections":
             concept_id = arguments["concept_id"]
-            
-            query = f"""
+            limit = arguments.get("limit", 50)
+
+            # Summary: count per entity type
+            summary_query = f"""
             MATCH (concept {{id: "{concept_id}"}})-[r]-(connected)
-            WITH concept, labels(connected)[0] AS entity_type, COUNT(*) AS count
-            RETURN concept.name AS concept, entity_type, count
+            WITH labels(connected)[0] AS entity_type, COUNT(*) AS count
+            RETURN entity_type, count
             ORDER BY count DESC
             """
-            
-            result = graph.query(query)
-            
-            if result.result_set:
-                formatted = format_query_results(result.result_set, result.header)
-                return [TextContent(type="text", text=f"Connection analysis for {concept_id}:\n\n{formatted}")]
+
+            # Leaf nodes: individual connected entities with relationship info
+            detail_query = f"""
+            MATCH (concept {{id: "{concept_id}"}})-[r]-(connected)
+            RETURN
+                type(r) AS relationship,
+                labels(connected)[0] AS connected_type,
+                connected.name AS connected_name,
+                connected.id AS connected_id
+            ORDER BY labels(connected)[0], type(r), connected.name
+            LIMIT {limit}
+            """
+
+            summary_result = graph.query(summary_query)
+            detail_result = graph.query(detail_query)
+
+            if detail_result.result_set:
+                summary_text = ""
+                if summary_result.result_set:
+                    summary_lines = [f"  {row[0]}: {row[1]}" for row in summary_result.result_set]
+                    summary_text = "Connection summary:\n" + "\n".join(summary_lines) + "\n\n"
+
+                formatted = format_query_results(detail_result.result_set, detail_result.header)
+                response_text = (
+                    f"Connections for {concept_id}:\n\n"
+                    + summary_text
+                    + f"Connected nodes ({len(detail_result.result_set)} shown):\n"
+                    + formatted
+                )
+                if len(response_text) > 50000:
+                    response_text = response_text[:50000] + "\n\n... (truncated)"
+                return [TextContent(type="text", text=response_text)]
             else:
                 return [TextContent(type="text", text=f"No connections found for {concept_id}")]
         
