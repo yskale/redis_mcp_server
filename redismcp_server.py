@@ -10,6 +10,7 @@ import argparse
 import redis
 from redis.commands.graph import Graph
 
+import json
 import httpx
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
@@ -394,33 +395,19 @@ async def list_tools() -> list[Tool]:
     ]
 
 
-def format_query_results(result_set, header=None) -> str:
-    """Format query results nicely"""
-    if not result_set:
-        return "No results found."
-
-    # Extract column names from header (format: [[type_code, col_name], ...])
-    formatted_lines = []
-    if header:
-        col_names = [col[1] for col in header]
-        formatted_lines.append(" | ".join(col_names))
-        formatted_lines.append("-" * (sum(len(c) for c in col_names) + 3 * len(col_names)))
-
-    # Add all data rows with truncation for very long values
+def results_to_list(result_set, header) -> list[dict]:
+    """Convert a RedisGraph result set to a list of dicts keyed by column name."""
+    if not result_set or not header:
+        return []
+    col_names = [col[1] for col in header]
+    rows = []
     for row in result_set:
-        truncated_row = []
-        for v in row:
-            if v is None:
-                truncated_row.append("NULL")
-            else:
-                str_v = str(v)
-                if len(str_v) > 200:
-                    truncated_row.append(str_v[:197] + "...")
-                else:
-                    truncated_row.append(str_v)
-        formatted_lines.append(" | ".join(truncated_row))
+        rows.append({col: val for col, val in zip(col_names, row)})
+    return rows
 
-    return "\n".join(formatted_lines)
+
+def to_json(data) -> str:
+    return json.dumps(data, indent=2, default=str)
 
 
 @app.call_tool()
@@ -431,51 +418,41 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         
         if name == "cypher_query":
             query = arguments["query"]
-
-            # Execute query
             result = graph.query(query)
 
-            # Format results
             if result.result_set and len(result.result_set) > 0:
-                formatted = format_query_results(result.result_set, result.header)
-                stats = f"\n\nRows returned: {len(result.result_set)}"
-                if result.execution_time:
-                    stats += f"\nExecution time: {result.execution_time}ms"
-
-                response_text = formatted + stats
-                # Limit total response size
-                if len(response_text) > 50000:
-                    response_text = response_text[:50000] + f"\n\n... (truncated for display)"
-
-                return [TextContent(type="text", text=response_text)]
+                rows = results_to_list(result.result_set, result.header)
+                out = to_json({
+                    "rows_returned": len(rows),
+                    "execution_time_ms": result.execution_time,
+                    "results": rows,
+                })
+                if len(out) > 50000:
+                    out = out[:50000] + "\n... (truncated)"
+                return [TextContent(type="text", text=out)]
             else:
-                return [TextContent(type="text", text="Query executed successfully but returned no results.")]
-        
+                return [TextContent(type="text", text=to_json({"rows_returned": 0, "results": []}))]
+
         elif name == "search_concepts":
             search_term = arguments["search_term"]
             node_type = arguments.get("node_type")
             find_variables = arguments.get("find_variables", False)
             limit = arguments.get("limit", 20)
 
-            # If user wants variables related to a concept — enrich with synonyms first
             if find_variables:
                 synonyms = await fetch_synonyms(search_term)
                 curies = synonyms["curies"]
                 labels = synonyms["labels"]
 
-                # Build Cypher IN-list strings (quoted, comma-separated)
                 curie_list = ", ".join(f'"{c}"' for c in curies) if curies else None
                 label_list = ", ".join(f'"{l}"' for l in labels) if labels else None
 
-                # Match concept by enriched CURIEs or enriched labels (no raw CONTAINS —
-                # that would match StudyVariable nodes like "activeasthma" as concepts)
                 where_clauses = []
                 if curie_list:
                     where_clauses.append(f"concept.id IN [{curie_list}]")
                 if label_list:
                     where_clauses.append(f"concept.name IN [{label_list}]")
                 if not where_clauses:
-                    # Fallback only when both services returned nothing
                     where_clauses.append(f"concept.name CONTAINS '{search_term}'")
                 where_expr = " OR ".join(where_clauses)
 
@@ -492,32 +469,17 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 LIMIT {limit}
                 """
                 result = graph.query(query)
+                rows = results_to_list(result.result_set, result.header) if result.result_set else []
+                out = to_json({
+                    "search_term": search_term,
+                    "enrichment": {"curies": curies, "labels": labels},
+                    "total_results": len(rows),
+                    "variables": rows,
+                })
+                if len(out) > 50000:
+                    out = out[:50000] + "\n... (truncated)"
+                return [TextContent(type="text", text=out)]
 
-                enrichment_summary = (
-                    f"Synonym enrichment (Name Resolution SRI + SAP-BERT): "
-                    f"{len(curies)} unique CURIEs, {len(labels)} unique labels.\n"
-                    f"CURIEs: {', '.join(curies[:5])}{'...' if len(curies) > 5 else ''}\n"
-                    f"Labels: {', '.join(labels[:5])}{'...' if len(labels) > 5 else ''}\n\n"
-                )
-
-                if result.result_set and len(result.result_set) > 0:
-                    formatted = format_query_results(result.result_set, result.header)
-                    result_count = len(result.result_set)
-                    response_text = (
-                        f"Found {result_count} variables related to '{search_term}' "
-                        f"(including synonyms):\n\n"
-                        + enrichment_summary + formatted
-                    )
-                    if len(response_text) > 50000:
-                        response_text = response_text[:50000] + f"\n\n... (truncated, showing first portion of {result_count} results)"
-                    return [TextContent(type="text", text=response_text)]
-                else:
-                    return [TextContent(type="text", text=
-                        f"No variables found related to '{search_term}' (including synonyms).\n\n"
-                        + enrichment_summary
-                    )]
-
-            # Otherwise search for concepts by name
             else:
                 if node_type:
                     query = f"""
@@ -533,32 +495,27 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                     RETURN labels(n)[0] AS type, n.name AS name, n.id AS id
                     LIMIT {limit}
                     """
-
                 result = graph.query(query)
+                rows = results_to_list(result.result_set, result.header) if result.result_set else []
+                out = to_json({
+                    "search_term": search_term,
+                    "node_type": node_type,
+                    "total_results": len(rows),
+                    "concepts": rows,
+                })
+                if len(out) > 50000:
+                    out = out[:50000] + "\n... (truncated)"
+                return [TextContent(type="text", text=out)]
 
-                if result.result_set and len(result.result_set) > 0:
-                    formatted = format_query_results(result.result_set, result.header)
-                    result_count = len(result.result_set)
-                    response_text = f"Found {result_count} concepts:\n\n{formatted}"
-
-                    # Limit total response size to prevent hanging
-                    if len(response_text) > 50000:
-                        response_text = response_text[:50000] + f"\n\n... (truncated, showing first portion of {result_count} results)"
-
-                    return [TextContent(type="text", text=response_text)]
-                else:
-                    return [TextContent(type="text", text=f"No concepts found matching '{search_term}'")]
-        
         elif name == "get_concept_graph":
             concept_id = arguments["concept_id"]
             expand_depth = min(arguments.get("expand_depth", 2), 3)
             limit = arguments.get("limit", 100)
-            
-            # FIXED: Proper backtick escaping
+
             if expand_depth == 1:
                 query = f"""
                 MATCH (concept {{id: "{concept_id}"}})-[r1]-(connected)
-                RETURN concept.name AS concept, 
+                RETURN concept.name AS concept,
                        type(r1) AS rel_type,
                        labels(connected)[0] AS connected_type,
                        connected.name AS connected_name,
@@ -582,20 +539,21 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                     COUNT(DISTINCT related) AS related_concepts_count
                 LIMIT {limit}
                 """
-            
+
             result = graph.query(query)
-            
             if result.result_set:
-                formatted = format_query_results(result.result_set, result.header)
-                return [TextContent(type="text", text=f"Concept subgraph for {concept_id}:\n\n{formatted}")]
+                rows = results_to_list(result.result_set, result.header)
+                out = to_json({"concept_id": concept_id, "expand_depth": expand_depth, "total_results": len(rows), "graph": rows})
+                if len(out) > 50000:
+                    out = out[:50000] + "\n... (truncated)"
+                return [TextContent(type="text", text=out)]
             else:
-                return [TextContent(type="text", text=f"No data found for concept ID: {concept_id}")]
-        
+                return [TextContent(type="text", text=to_json({"concept_id": concept_id, "total_results": 0, "graph": []}))]
+
         elif name == "find_connected_studies":
             concept_id = arguments["concept_id"]
             limit = arguments.get("limit", 50)
-            
-            # FIXED: Proper backtick escaping
+
             query = f"""
             MATCH (concept {{id: "{concept_id}"}})--(variable:`biolink.StudyVariable`)--(study:`biolink.Study`)
             RETURN DISTINCT
@@ -606,29 +564,26 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 study.id AS study_id
             LIMIT {limit}
             """
-            
+
             result = graph.query(query)
-            
-            if result.result_set:
-                formatted = format_query_results(result.result_set, result.header)
-                return [TextContent(type="text", text=f"Studies connected to {concept_id}:\n\n{formatted}")]
-            else:
-                return [TextContent(type="text", text=f"No studies found connected to {concept_id}")]
-        
+            rows = results_to_list(result.result_set, result.header) if result.result_set else []
+            out = to_json({"concept_id": concept_id, "total_results": len(rows), "studies": rows})
+            if len(out) > 50000:
+                out = out[:50000] + "\n... (truncated)"
+            return [TextContent(type="text", text=out)]
+
         elif name == "get_concept_connections":
             concept_id = arguments["concept_id"]
             limit = arguments.get("limit", 50)
 
-            # Summary: count per entity type
-            summary_query = f"""
+            summary_result = graph.query(f"""
             MATCH (concept {{id: "{concept_id}"}})-[r]-(connected)
             WITH labels(connected)[0] AS entity_type, COUNT(*) AS count
             RETURN entity_type, count
             ORDER BY count DESC
-            """
+            """)
 
-            # Leaf nodes: individual connected entities with relationship info
-            detail_query = f"""
+            detail_result = graph.query(f"""
             MATCH (concept {{id: "{concept_id}"}})-[r]-(connected)
             RETURN
                 type(r) AS relationship,
@@ -637,33 +592,23 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 connected.id AS connected_id
             ORDER BY labels(connected)[0], type(r), connected.name
             LIMIT {limit}
-            """
+            """)
 
-            summary_result = graph.query(summary_query)
-            detail_result = graph.query(detail_query)
+            summary = [{"entity_type": row[0], "count": row[1]} for row in (summary_result.result_set or [])]
+            connections = results_to_list(detail_result.result_set, detail_result.header) if detail_result.result_set else []
+            out = to_json({
+                "concept_id": concept_id,
+                "summary": summary,
+                "total_connections_shown": len(connections),
+                "connections": connections,
+            })
+            if len(out) > 50000:
+                out = out[:50000] + "\n... (truncated)"
+            return [TextContent(type="text", text=out)]
 
-            if detail_result.result_set:
-                summary_text = ""
-                if summary_result.result_set:
-                    summary_lines = [f"  {row[0]}: {row[1]}" for row in summary_result.result_set]
-                    summary_text = "Connection summary:\n" + "\n".join(summary_lines) + "\n\n"
-
-                formatted = format_query_results(detail_result.result_set, detail_result.header)
-                response_text = (
-                    f"Connections for {concept_id}:\n\n"
-                    + summary_text
-                    + f"Connected nodes ({len(detail_result.result_set)} shown):\n"
-                    + formatted
-                )
-                if len(response_text) > 50000:
-                    response_text = response_text[:50000] + "\n\n... (truncated)"
-                return [TextContent(type="text", text=response_text)]
-            else:
-                return [TextContent(type="text", text=f"No connections found for {concept_id}")]
-        
         elif name == "list_graph_schema":
             show_counts = arguments.get("show_counts", True)
-            
+
             if show_counts:
                 query = """
                 MATCH (n)
@@ -678,19 +623,15 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 RETURN node_type
                 ORDER BY node_type
                 """
-            
+
             result = graph.query(query)
-            
-            if result.result_set:
-                formatted = format_query_results(result.result_set, result.header)
-                return [TextContent(type="text", text=f"Graph Schema:\n\n{formatted}")]
-            else:
-                return [TextContent(type="text", text="Could not retrieve graph schema")]
-        
+            rows = results_to_list(result.result_set, result.header) if result.result_set else []
+            return [TextContent(type="text", text=to_json({"schema": rows}))]
+
         elif name == "find_highly_connected_variables":
             min_connections = arguments.get("min_connections", 10)
             limit = arguments.get("limit", 20)
-            
+
             query = f"""
             MATCH (v:`biolink.StudyVariable`)--(c)
             WITH v, COUNT(DISTINCT c) AS connection_count
@@ -699,20 +640,20 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             ORDER BY connection_count DESC
             LIMIT {limit}
             """
-            
+
             result = graph.query(query)
-            
-            if result.result_set:
-                formatted = format_query_results(result.result_set, result.header)
-                return [TextContent(type="text", text=f"Highly connected variables (>= {min_connections} connections):\n\n{formatted}")]
-            else:
-                return [TextContent(type="text", text=f"No variables found with {min_connections}+ connections")]
-        
+            rows = results_to_list(result.result_set, result.header) if result.result_set else []
+            return [TextContent(type="text", text=to_json({
+                "min_connections": min_connections,
+                "total_results": len(rows),
+                "variables": rows,
+            }))]
+
         elif name == "explore_concept_neighborhood":
             concept_id = arguments["concept_id"]
             node_type_filter = arguments.get("node_type_filter")
             limit = arguments.get("limit", 50)
-            
+
             if node_type_filter:
                 query = f"""
                 MATCH (concept {{id: "{concept_id}"}})-[r]-(neighbor:`biolink.{node_type_filter}`)
@@ -733,15 +674,19 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                        neighbor.id AS neighbor_id
                 LIMIT {limit}
                 """
-            
+
             result = graph.query(query)
-            
-            if result.result_set:
-                formatted = format_query_results(result.result_set, result.header)
-                return [TextContent(type="text", text=f"Neighborhood of {concept_id}:\n\n{formatted}")]
-            else:
-                return [TextContent(type="text", text=f"No neighbors found for {concept_id}")]
-        
+            rows = results_to_list(result.result_set, result.header) if result.result_set else []
+            out = to_json({
+                "concept_id": concept_id,
+                "node_type_filter": node_type_filter,
+                "total_results": len(rows),
+                "neighbors": rows,
+            })
+            if len(out) > 50000:
+                out = out[:50000] + "\n... (truncated)"
+            return [TextContent(type="text", text=out)]
+
         elif name == "search_variables_by_name":
             search_term = arguments["search_term"]
             limit = arguments.get("limit", 20)
@@ -754,18 +699,11 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             """
 
             result = graph.query(query)
-
-            if result.result_set and len(result.result_set) > 0:
-                formatted = format_query_results(result.result_set, result.header)
-                result_count = len(result.result_set)
-                response_text = f"Found {result_count} variables matching '{search_term}':\n\n{formatted}"
-
-                if len(response_text) > 50000:
-                    response_text = response_text[:50000] + f"\n\n... (truncated, showing first portion of {result_count} results)"
-
-                return [TextContent(type="text", text=response_text)]
-            else:
-                return [TextContent(type="text", text=f"No variables found matching '{search_term}'")]
+            rows = results_to_list(result.result_set, result.header) if result.result_set else []
+            out = to_json({"search_term": search_term, "total_results": len(rows), "variables": rows})
+            if len(out) > 50000:
+                out = out[:50000] + "\n... (truncated)"
+            return [TextContent(type="text", text=out)]
 
         elif name == "get_variable_details":
             variable_id = arguments["variable_id"]
@@ -785,17 +723,11 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             """
 
             result = graph.query(query)
-
-            if result.result_set and len(result.result_set) > 0:
-                formatted = format_query_results(result.result_set, result.header)
-                response_text = f"Details for variable {variable_id}:\n\n{formatted}"
-
-                if len(response_text) > 50000:
-                    response_text = response_text[:50000] + f"\n\n... (truncated for display)"
-
-                return [TextContent(type="text", text=response_text)]
-            else:
-                return [TextContent(type="text", text=f"Variable not found: {variable_id}")]
+            rows = results_to_list(result.result_set, result.header) if result.result_set else []
+            out = to_json({"variable_id": variable_id, "total_connections": len(rows), "details": rows})
+            if len(out) > 50000:
+                out = out[:50000] + "\n... (truncated)"
+            return [TextContent(type="text", text=out)]
 
         elif name == "expand_concept":
             concept_id = arguments["concept_id"]
@@ -803,9 +735,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             relationship_types = arguments.get("relationship_types")
             limit = arguments.get("limit", 50)
 
-            # Build query based on whether relationship filter is specified
             if relationship_types and len(relationship_types) > 0:
-                # With relationship type filtering - use WHERE clause instead
                 query = f"""
                 MATCH path = (source {{id: "{concept_id}"}})-[r*1..{max_hops}]-(expanded)
                 WHERE source <> expanded
@@ -824,7 +754,6 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 LIMIT {limit}
                 """
             else:
-                # No relationship filtering
                 query = f"""
                 MATCH path = (source {{id: "{concept_id}"}})-[r*1..{max_hops}]-(expanded)
                 WHERE source <> expanded
@@ -843,18 +772,17 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 """
 
             result = graph.query(query)
-
-            if result.result_set and len(result.result_set) > 0:
-                formatted = format_query_results(result.result_set, result.header)
-                result_count = len(result.result_set)
-                response_text = f"Expanded {concept_id} to {result_count} related concepts:\n\n{formatted}"
-
-                if len(response_text) > 50000:
-                    response_text = response_text[:50000] + f"\n\n... (truncated, showing first portion)"
-
-                return [TextContent(type="text", text=response_text)]
-            else:
-                return [TextContent(type="text", text=f"No expanded concepts found for {concept_id}")]
+            rows = results_to_list(result.result_set, result.header) if result.result_set else []
+            out = to_json({
+                "concept_id": concept_id,
+                "max_hops": max_hops,
+                "relationship_types": relationship_types,
+                "total_results": len(rows),
+                "expanded": rows,
+            })
+            if len(out) > 50000:
+                out = out[:50000] + "\n... (truncated)"
+            return [TextContent(type="text", text=out)]
 
         elif name == "find_concept_paths":
             source_id = arguments["source_id"]
@@ -880,25 +808,23 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             """
 
             result = graph.query(query)
-
-            if result.result_set and len(result.result_set) > 0:
-                formatted = format_query_results(result.result_set, result.header)
-                result_count = len(result.result_set)
-                response_text = f"Found {result_count} paths from {source_id} to {target_id}:\n\n{formatted}"
-
-                if len(response_text) > 50000:
-                    response_text = response_text[:50000] + f"\n\n... (truncated)"
-
-                return [TextContent(type="text", text=response_text)]
-            else:
-                return [TextContent(type="text", text=f"No paths found between {source_id} and {target_id} (max length: {max_path_length})")]
+            rows = results_to_list(result.result_set, result.header) if result.result_set else []
+            out = to_json({
+                "source_id": source_id,
+                "target_id": target_id,
+                "max_path_length": max_path_length,
+                "total_paths": len(rows),
+                "paths": rows,
+            })
+            if len(out) > 50000:
+                out = out[:50000] + "\n... (truncated)"
+            return [TextContent(type="text", text=out)]
 
         else:
-            return [TextContent(type="text", text=f"Unknown tool: {name}")]
+            return [TextContent(type="text", text=to_json({"error": f"Unknown tool: {name}"}))]
 
     except Exception as e:
-        error_msg = f"Error executing tool '{name}': {str(e)}"
-        return [TextContent(type="text", text=error_msg)]
+        return [TextContent(type="text", text=to_json({"error": f"Error executing tool '{name}': {str(e)}"}))]
 
 
 def create_sse_app():
