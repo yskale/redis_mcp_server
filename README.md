@@ -227,6 +227,45 @@ List all node types in the graph with counts. Recommended as a first step for an
 
 ---
 
+### `trapi_query`
+
+Query the knowledge graph using a standard [TRAPI (Translator Reasoner API)](https://github.com/NCATSTranslator/ReasonerAPI) query graph. Automatically handles the biolink predicate hierarchy — querying a parent predicate like `biolink:related_to` also matches all child predicates. Returns clean JSON with `category`, `id`, and `name` fields for each node.
+
+**Disease → StudyVariable (by CURIE):**
+```json
+{
+  "qgraph": {
+    "nodes": {
+      "disease": {"ids": ["MONDO:0004979"], "categories": ["biolink:Disease"]},
+      "variable": {"categories": ["biolink:StudyVariable"]}
+    },
+    "edges": {
+      "e0": {"subject": "disease", "object": "variable"}
+    }
+  },
+  "limit": 10
+}
+```
+
+**PhenotypicFeature → StudyVariable:**
+```json
+{
+  "qgraph": {
+    "nodes": {
+      "phenotype": {"categories": ["biolink:PhenotypicFeature"]},
+      "variable": {"categories": ["biolink:StudyVariable"]}
+    },
+    "edges": {
+      "e0": {"subject": "phenotype", "object": "variable"}
+    }
+  }
+}
+```
+
+The `cypher_used` field in the response shows the generated Cypher for transparency and debugging.
+
+---
+
 ### `cypher_query`
 
 Execute a raw Cypher query directly against RedisGraph. Use backticks for biolink labels containing dots.

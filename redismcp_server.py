@@ -654,6 +654,38 @@ async def list_tools() -> list[Tool]:
     ]
 
 
+def _serialize_value(val):
+    """Convert a RedisGraph Node/Edge/Path to a clean dict; pass through scalars."""
+    cls = type(val).__name__
+    if cls == "Node":
+        label = (val.labels[0] if val.labels else "")
+        category = label.replace("biolink.", "biolink:") if label else None
+        props = dict(val.properties) if val.properties else {}
+        out = {}
+        if category:
+            out["category"] = category
+        out["id"] = props.get("id", props.get("curie", None))
+        out["name"] = props.get("name", None)
+        extra = {k: v for k, v in props.items() if k not in ("id", "curie", "name")}
+        if extra:
+            out["properties"] = extra
+        return out
+    elif cls == "Edge":
+        rel = getattr(val, "relation", None) or getattr(val, "type", None) or ""
+        predicate = rel.replace("biolink.", "biolink:") if rel else None
+        props = dict(val.properties) if val.properties else {}
+        return {
+            "predicate": predicate,
+            "src_node": val.src_node,
+            "dest_node": val.dest_node,
+            **({"properties": props} if props else {}),
+        }
+    elif cls == "Path":
+        return {"nodes": [_serialize_value(n) for n in val.nodes],
+                "edges": [_serialize_value(e) for e in val.edges]}
+    return val
+
+
 def results_to_list(result_set, header) -> list[dict]:
     """Convert a RedisGraph result set to a list of dicts keyed by column name."""
     if not result_set or not header:
@@ -661,7 +693,7 @@ def results_to_list(result_set, header) -> list[dict]:
     col_names = [col[1] for col in header]
     rows = []
     for row in result_set:
-        rows.append({col: val for col, val in zip(col_names, row)})
+        rows.append({col: _serialize_value(val) for col, val in zip(col_names, row)})
     return rows
 
 
