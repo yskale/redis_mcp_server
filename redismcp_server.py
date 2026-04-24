@@ -11,7 +11,9 @@ import redis
 from redis.commands.graph import Graph
 
 import json
+import re
 import httpx
+from reasoner_transpiler.cypher import get_query as trapi_get_query
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp.server.sse import SseServerTransport
@@ -173,6 +175,21 @@ async def list_prompts() -> list[Prompt]:
                 ),
             ],
         ),
+        Prompt(
+            name="trapi_query_builder",
+            description=(
+                "Build and execute a TRAPI query graph against the knowledge graph. "
+                "Guides the LLM to construct a valid TRAPI query for a given biomedical question, "
+                "with automatic biolink predicate hierarchy expansion."
+            ),
+            arguments=[
+                PromptArgument(
+                    name="question",
+                    description="Biomedical question to answer (e.g. 'What study variables are associated with asthma?')",
+                    required=True,
+                ),
+            ],
+        ),
     ]
 
 
@@ -307,6 +324,42 @@ async def get_prompt(name: str, arguments: dict) -> GetPromptResult:
             ],
         )
 
+    elif name == "trapi_query_builder":
+        question = arguments.get("question", "")
+        return GetPromptResult(
+            description=f"Build a TRAPI query to answer: '{question}'",
+            messages=[
+                PromptMessage(
+                    role="user",
+                    content=TextContent(
+                        type="text",
+                        text=(
+                            f"I want to answer this biomedical question using the knowledge graph:\n\n"
+                            f"\"{question}\"\n\n"
+                            f"Please construct a TRAPI query graph and run it using the `trapi_query` tool.\n\n"
+                            f"A TRAPI query graph has this structure:\n"
+                            f"{{\n"
+                            f"  \"nodes\": {{\n"
+                            f"    \"<node_key>\": {{\"ids\": [\"<CURIE>\"], \"categories\": [\"biolink:<Type>\"]}}\n"
+                            f"  }},\n"
+                            f"  \"edges\": {{\n"
+                            f"    \"<edge_key>\": {{\"subject\": \"<node_key>\", \"object\": \"<node_key>\", \"predicates\": [\"biolink:<predicate>\"]}}\n"
+                            f"  }}\n"
+                            f"}}\n\n"
+                            f"Guidelines:\n"
+                            f"- Use biolink categories like: biolink:Disease, biolink:PhenotypicFeature, biolink:StudyVariable, biolink:Gene\n"
+                            f"- Use biolink predicates like: biolink:related_to, biolink:has_phenotype, biolink:associated_with\n"
+                            f"- Omit 'ids' or 'categories' if unknown — the graph will match any node\n"
+                            f"- Omit 'predicates' on an edge to match any relationship\n"
+                            f"- The predicate hierarchy is automatically expanded (e.g. biolink:related_to includes all child predicates)\n\n"
+                            f"If you're unsure of the exact CURIE, first use `search_concepts` to find it, "
+                            f"then build the TRAPI query with the ID."
+                        ),
+                    ),
+                )
+            ],
+        )
+
     else:
         raise ValueError(f"Unknown prompt: {name}")
 
@@ -343,6 +396,43 @@ def get_redis_connection():
 async def list_tools() -> list[Tool]:
     """List available tools for querying the Redis graph"""
     return [
+        Tool(
+            name="trapi_query",
+            description=(
+                "Query the knowledge graph using a standard TRAPI (Translator Reasoner API) query graph. "
+                "Automatically handles the biolink predicate hierarchy — querying a parent predicate like "
+                "'biolink:related_to' also matches all its child predicates (e.g. associated_with, correlated_with, etc.). "
+                "Use this for structured biomedical queries without needing to know Cypher syntax. "
+                "Nodes can be filtered by biolink category and/or specific IDs (CURIEs). "
+                "Edges can be filtered by biolink predicate."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "qgraph": {
+                        "type": "object",
+                        "description": (
+                            "TRAPI query graph with 'nodes' (dict of node_key → {ids?, categories?}) "
+                            "and 'edges' (dict of edge_key → {subject, object, predicates?}). "
+                            "Example: {\"nodes\": {\"disease\": {\"ids\": [\"MONDO:0004979\"], \"categories\": [\"biolink:Disease\"]}, "
+                            "\"variable\": {\"categories\": [\"biolink:StudyVariable\"]}}, "
+                            "\"edges\": {\"e0\": {\"subject\": \"disease\", \"object\": \"variable\"}}}"
+                        ),
+                        "properties": {
+                            "nodes": {"type": "object"},
+                            "edges": {"type": "object"}
+                        },
+                        "required": ["nodes", "edges"]
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Maximum results to return",
+                        "default": 50
+                    }
+                },
+                "required": ["qgraph"]
+            }
+        ),
         Tool(
             name="cypher_query",
             description="Execute a raw Cypher query on the Redis biomedical knowledge graph. Use backticks for labels with dots: `biolink.Disease`",
@@ -585,7 +675,33 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
     try:
         _, graph = get_redis_connection()
         
-        if name == "cypher_query":
+        if name == "trapi_query":
+            qgraph = arguments["qgraph"]
+            limit  = arguments.get("limit", 50)
+
+            # Generate Cypher from TRAPI query graph using reasoner-transpiler.
+            # Use memgraph dialect (uses id() instead of elementId()) — closer to RedisGraph.
+            # reasoner=False gives plain Cypher without TRAPI result wrapping.
+            cypher = trapi_get_query(qgraph, reasoner=False, dialect="memgraph")
+
+            # RedisGraph uses backtick-wrapped dot notation: `biolink.Disease`
+            # Transpiler outputs colon notation: `biolink:Disease` — convert it.
+            cypher = re.sub(r'`biolink:(\w+)`', r'`biolink.\1`', cypher)
+
+            # Append limit
+            if "LIMIT" not in cypher.upper():
+                cypher += f" LIMIT {limit}"
+
+            result = graph.query(cypher)
+            rows = results_to_list(result.result_set, result.header) if result.result_set else []
+            return [TextContent(type="text", text=to_json({
+                "qgraph": qgraph,
+                "cypher_used": cypher,
+                "total_results": len(rows),
+                "results": rows,
+            }))]
+
+        elif name == "cypher_query":
             query = arguments["query"]
             result = graph.query(query)
 
