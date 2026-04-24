@@ -658,7 +658,9 @@ def _serialize_value(val):
     """Convert a RedisGraph Node/Edge/Path to a clean dict; pass through scalars."""
     cls = type(val).__name__
     if cls == "Node":
-        label = (val.labels[0] if val.labels else "")
+        # labels is a list ordered general→specific; pick the last (most specific)
+        labels = val.labels if val.labels else []
+        label = labels[-1] if labels else ""
         category = label.replace("biolink.", "biolink:") if label else None
         props = dict(val.properties) if val.properties else {}
         out = {}
@@ -671,7 +673,7 @@ def _serialize_value(val):
             out["properties"] = extra
         return out
     elif cls == "Edge":
-        rel = getattr(val, "relation", None) or getattr(val, "type", None) or ""
+        rel = getattr(val, "relation", None) or ""
         predicate = rel.replace("biolink.", "biolink:") if rel else None
         props = dict(val.properties) if val.properties else {}
         return {
@@ -681,8 +683,11 @@ def _serialize_value(val):
             **({"properties": props} if props else {}),
         }
     elif cls == "Path":
-        return {"nodes": [_serialize_value(n) for n in val.nodes],
-                "edges": [_serialize_value(e) for e in val.edges]}
+        # Path.nodes() and Path.edges() are methods, not properties
+        nodes = val.nodes() if callable(val.nodes) else val.nodes
+        edges = val.edges() if callable(val.edges) else val.edges
+        return {"nodes": [_serialize_value(n) for n in nodes],
+                "edges": [_serialize_value(e) for e in edges]}
     return val
 
 
