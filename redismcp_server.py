@@ -821,12 +821,18 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                             "variable_description": row.get("variable_description"),
                             "matched_concepts": [],
                         }
-                    variables[vid]["matched_concepts"].append({
-                        "concept_id": row["concept_id"],
-                        "concept_name": row["concept_name"],
-                        "concept_type": row["concept_type"].replace("biolink.", "biolink:") if row.get("concept_type") else None,
-                        "predicate": row["predicate"].replace("biolink.", "biolink:") if row.get("predicate") else None,
-                    })
+                    concept_id = row["concept_id"]
+                    predicate = row["predicate"].replace("biolink.", "biolink:") if row.get("predicate") else None
+                    # Dedup matched concepts by (concept_id, predicate) — graph can have
+                    # edges in both directions between the same pair of nodes.
+                    seen = {(c["concept_id"], c["predicate"]) for c in variables[vid]["matched_concepts"]}
+                    if (concept_id, predicate) not in seen:
+                        variables[vid]["matched_concepts"].append({
+                            "concept_id": concept_id,
+                            "concept_name": row["concept_name"],
+                            "concept_type": row["concept_type"].replace("biolink.", "biolink:") if row.get("concept_type") else None,
+                            "predicate": predicate,
+                        })
 
                 # Sort by number of matched concepts descending (relevance proxy),
                 # then apply limit on unique variables.
