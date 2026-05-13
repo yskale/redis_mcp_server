@@ -95,7 +95,7 @@ All tools return JSON. Below is each tool, what it does, and a concrete example.
 
 Search for biomedical concepts by name, or find study variables related to a concept with **automatic synonym enrichment**.
 
-When `find_variables=true`, the term is expanded via Name Resolution SRI and SAP-BERT (up to 10 results each). The combined CURIEs and labels are then used to search the graph for connected `StudyVariable` nodes — providing broader coverage than a simple name match.
+When `find_variables=true`, the term is expanded via Name Resolution SRI and SAP-BERT (up to 10 results each). The combined CURIEs and labels are used to search the graph for connected `StudyVariable` nodes. Results are **deduplicated by variable** — each variable appears once with a `matched_concepts` array showing which concepts matched and via which predicate. The `limit` applies to unique variables, not raw rows. If either enrichment service is unavailable, a `warnings` field is included in the response so partial results are never silent.
 
 **Find concepts by name:**
 ```json
@@ -110,6 +110,26 @@ When `find_variables=true`, the term is expanded via Name Resolution SRI and SAP
 **Find variables with synonym enrichment:**
 ```json
 { "search_term": "asthma", "find_variables": true, "limit": 20 }
+```
+
+Example response shape for `find_variables=true`:
+```json
+{
+  "search_term": "asthma",
+  "enrichment": { "curies": ["MONDO:0004979", "..."], "labels": ["asthma", "..."] },
+  "total_results": 20,
+  "variables": [
+    {
+      "variable_id": "phv00425822.v1.p1",
+      "variable_name": "p_asth",
+      "variable_description": "lung, asthma/wheezing/reactive airway",
+      "matched_concepts": [
+        { "concept_id": "MONDO:0004979", "concept_name": "asthma", "concept_type": "biolink:Disease", "predicate": "biolink:related_to" },
+        { "concept_id": "MONDO:0004784", "concept_name": "allergic asthma", "concept_type": "biolink:Disease", "predicate": "biolink:related_to" }
+      ]
+    }
+  ]
+}
 ```
 
 ---
