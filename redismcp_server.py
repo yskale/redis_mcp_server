@@ -43,10 +43,13 @@ async def fetch_synonyms(search_term: str) -> dict:
     - Name Resolution SRI: returns normalized CURIEs and preferred labels
     - SAP-BERT Qdrant: returns semantically similar biomedical concepts
 
-    Returns {'curies': [...], 'labels': [...]} with up to 10 results from each source.
+    Returns {'curies': [...], 'labels': [...], 'warnings': [...]}
+    Warnings are populated when a service is unreachable or returns an error,
+    so callers can signal degraded results to the user.
     """
     curies = []
     labels = []
+    warnings = []
 
     async with httpx.AsyncClient(timeout=10.0) as client:
         nr_coro = client.get(NAME_RESOLUTION_URL, params={"string": search_term, "limit": 10})
@@ -57,18 +60,26 @@ async def fetch_synonyms(search_term: str) -> dict:
         nr_resp, sap_resp = await asyncio.gather(nr_coro, sap_coro, return_exceptions=True)
 
     # Name Resolution SRI: [{curie, label, synonyms, ...}, ...]
-    if not isinstance(nr_resp, Exception) and nr_resp.status_code == 200:
+    if isinstance(nr_resp, Exception):
+        warnings.append(f"Name Resolution SRI unavailable: {nr_resp}")
+    elif nr_resp.status_code != 200:
+        warnings.append(f"Name Resolution SRI returned HTTP {nr_resp.status_code} — results may be incomplete")
+    else:
         try:
             for item in nr_resp.json()[:10]:
                 if curie := item.get("curie"):
                     curies.append(curie)
                 if label := item.get("label"):
                     labels.append(label)
-        except Exception:
-            pass
+        except Exception as e:
+            warnings.append(f"Name Resolution SRI response could not be parsed: {e}")
 
     # SAP-BERT Qdrant: response structure varies; handle list or wrapped dict
-    if not isinstance(sap_resp, Exception) and sap_resp.status_code == 200:
+    if isinstance(sap_resp, Exception):
+        warnings.append(f"SAP-BERT unavailable: {sap_resp}")
+    elif sap_resp.status_code != 200:
+        warnings.append(f"SAP-BERT returned HTTP {sap_resp.status_code} — results may be incomplete")
+    else:
         try:
             sap_data = sap_resp.json()
             items = sap_data if isinstance(sap_data, list) else (
@@ -86,12 +97,13 @@ async def fetch_synonyms(search_term: str) -> dict:
                     if val := item.get(name_field):
                         labels.append(val)
                         break
-        except Exception:
-            pass
+        except Exception as e:
+            warnings.append(f"SAP-BERT response could not be parsed: {e}")
 
     return {
         "curies": list(dict.fromkeys(curies)),   # deduplicate, preserve order
         "labels": list(dict.fromkeys(labels)),
+        "warnings": warnings,
     }
 
 
@@ -765,6 +777,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 synonyms = await fetch_synonyms(search_term)
                 curies = synonyms["curies"]
                 labels = synonyms["labels"]
+                warnings = synonyms["warnings"]
 
                 curie_list = ", ".join(f'"{c}"' for c in curies) if curies else None
                 label_list = ", ".join(f'"{l}"' for l in labels) if labels else None
@@ -778,25 +791,57 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                     where_clauses.append(f"concept.name CONTAINS '{search_term}'")
                 where_expr = " OR ".join(where_clauses)
 
+                # Fetch all (variable, concept, predicate) matches — no LIMIT here.
+                # Dedup is done in Python after grouping by variable_id.
                 query = f"""
-                MATCH (concept)-[*1..2]-(v:`biolink.StudyVariable`)
+                MATCH (concept)-[r]-(v:`biolink.StudyVariable`)
                 WHERE ({where_expr})
                   AND NOT labels(concept)[0] = 'biolink.StudyVariable'
-                RETURN DISTINCT
-                    labels(concept)[0] AS concept_type,
+                RETURN
+                    v.id AS variable_id,
+                    v.name AS variable_name,
+                    v.description AS variable_description,
                     concept.id AS concept_id,
                     concept.name AS concept_name,
-                    v.name AS variable_name,
-                    v.id AS variable_id
-                LIMIT {limit}
+                    labels(concept)[0] AS concept_type,
+                    type(r) AS predicate
                 """
                 result = graph.query(query)
                 rows = results_to_list(result.result_set, result.header) if result.result_set else []
+
+                # Group by variable_id — one entry per unique variable,
+                # with a matched_concepts list showing which concepts and predicates matched.
+                variables: dict = {}
+                for row in rows:
+                    vid = row["variable_id"]
+                    if vid not in variables:
+                        variables[vid] = {
+                            "variable_id": vid,
+                            "variable_name": row["variable_name"],
+                            "variable_description": row.get("variable_description"),
+                            "matched_concepts": [],
+                        }
+                    variables[vid]["matched_concepts"].append({
+                        "concept_id": row["concept_id"],
+                        "concept_name": row["concept_name"],
+                        "concept_type": row["concept_type"].replace("biolink.", "biolink:") if row.get("concept_type") else None,
+                        "predicate": row["predicate"].replace("biolink.", "biolink:") if row.get("predicate") else None,
+                    })
+
+                # Sort by number of matched concepts descending (relevance proxy),
+                # then apply limit on unique variables.
+                unique_vars = sorted(variables.values(), key=lambda v: len(v["matched_concepts"]), reverse=True)
+                unique_vars = unique_vars[:limit]
+
                 out = to_json({
                     "search_term": search_term,
-                    "enrichment": {"curies": curies, "labels": labels},
-                    "total_results": len(rows),
-                    "variables": rows,
+                    "enrichment": {
+                        "curies": curies,
+                        "labels": labels,
+                        **({"warnings": warnings} if warnings else {}),
+                    },
+                    "total_results": len(unique_vars),
+                    "variables": unique_vars,
                 })
                 if len(out) > 50000:
                     out = out[:50000] + "\n... (truncated)"
