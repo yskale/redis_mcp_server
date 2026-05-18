@@ -26,6 +26,7 @@ import uvicorn
 
 NAME_RESOLUTION_URL = "https://name-resolution-sri.renci.org/lookup"
 SAP_QDRANT_URL = "https://sap-qdrant.example.com/annotate/"
+PICSURE_SEARCH_URL = "https://picsure.biodatacatalyst.nhlbi.nih.gov/picsure/search/ac004461-1b47-4832-80e2-22a4aecabe39"
 
 # Load environment variables from .env file
 load_dotenv()
@@ -662,6 +663,33 @@ async def list_tools() -> list[Tool]:
                 },
                 "required": ["source_id", "target_id"]
             }
+        ),
+        Tool(
+            name="picsure_search",
+            description=(
+                "Look up study variables in BioData Catalyst PIC-SURE by phv ID or keyword. "
+                "Use this after search_concepts or trapi_query to get the full PIC-SURE variable paths "
+                "needed to build a cohort query. Returns path, study accession, variable name, "
+                "and whether the variable is categorical or continuous. "
+                "No authentication required — uses the open PIC-SURE resource."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "phv_ids": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": (
+                            "List of phv IDs to look up (e.g. ['phv00425822', 'phv00347788']). "
+                            "Strip version suffixes — use 'phv00425822' not 'phv00425822.v1.p1'."
+                        )
+                    },
+                    "keyword": {
+                        "type": "string",
+                        "description": "Free-text keyword to search PIC-SURE variables (e.g. 'asthma'). Used when phv_ids are not available."
+                    }
+                }
+            }
         )
     ]
 
@@ -1108,6 +1136,65 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 "max_path_length": max_path_length,
                 "total_paths": len(rows),
                 "paths": rows,
+            })
+            if len(out) > 50000:
+                out = out[:50000] + "\n... (truncated)"
+            return [TextContent(type="text", text=out)]
+
+        elif name == "picsure_search":
+            phv_ids = arguments.get("phv_ids", [])
+            keyword = arguments.get("keyword", "")
+
+            if not phv_ids and not keyword:
+                return [TextContent(type="text", text=to_json({"error": "Provide phv_ids or keyword"}))]
+
+            # Strip version suffixes: "phv00425822.v1.p1" → "phv00425822"
+            search_terms = [pid.split(".")[0] if "." in pid else pid for pid in phv_ids]
+            if keyword:
+                search_terms.append(keyword)
+            search_terms = list(dict.fromkeys(search_terms))  # deduplicate
+
+            results = []
+            warnings = []
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                responses = await asyncio.gather(*[
+                    client.post(PICSURE_SEARCH_URL, json={"query": term})
+                    for term in search_terms
+                ], return_exceptions=True)
+
+            for term, resp in zip(search_terms, responses):
+                if isinstance(resp, Exception):
+                    warnings.append(f"PIC-SURE search failed for '{term}': {resp}")
+                    continue
+                if resp.status_code != 200:
+                    warnings.append(f"PIC-SURE returned HTTP {resp.status_code} for '{term}'")
+                    continue
+                try:
+                    phenotypes = resp.json().get("results", {}).get("phenotypes", {})
+                    for path, meta in phenotypes.items():
+                        parts = [p for p in path.strip("\\").split("\\") if p]
+                        study = parts[0] if parts else None
+                        phv   = next((p for p in parts if p.startswith("phv")), None)
+                        vname = parts[-1] if len(parts) > 1 else None
+                        cat_values = meta.get("categoryValues", [])
+                        results.append({
+                            "search_term": term,
+                            "picsure_path": path,
+                            "study": study,
+                            "phv_id": phv,
+                            "variable_name": vname,
+                            "categorical": meta.get("categorical"),
+                            "category_values": cat_values[:20],
+                            "total_category_values": len(cat_values),
+                        })
+                except Exception as e:
+                    warnings.append(f"Failed to parse PIC-SURE response for '{term}': {e}")
+
+            out = to_json({
+                "search_terms": search_terms,
+                "total_variables_found": len(results),
+                "variables": results,
+                **({"warnings": warnings} if warnings else {}),
             })
             if len(out) > 50000:
                 out = out[:50000] + "\n... (truncated)"
