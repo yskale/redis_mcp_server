@@ -687,6 +687,11 @@ async def list_tools() -> list[Tool]:
                     "keyword": {
                         "type": "string",
                         "description": "Free-text keyword to search PIC-SURE variables (e.g. 'asthma'). Used when phv_ids are not available."
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Maximum number of variable paths to return per search term",
+                        "default": 20
                     }
                 }
             }
@@ -1144,6 +1149,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         elif name == "picsure_search":
             phv_ids = arguments.get("phv_ids", [])
             keyword = arguments.get("keyword", "")
+            limit   = arguments.get("limit", 20)
 
             if not phv_ids and not keyword:
                 return [TextContent(type="text", text=to_json({"error": "Provide phv_ids or keyword"}))]
@@ -1171,7 +1177,10 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                     continue
                 try:
                     phenotypes = resp.json().get("results", {}).get("phenotypes", {})
+                    term_count = 0
                     for path, meta in phenotypes.items():
+                        if term_count >= limit:
+                            break
                         parts = [p for p in path.strip("\\").split("\\") if p]
                         study = parts[0] if parts else None
                         phv   = next((p for p in parts if p.startswith("phv")), None)
@@ -1187,6 +1196,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                             "category_values": cat_values[:20],
                             "total_category_values": len(cat_values),
                         })
+                        term_count += 1
                 except Exception as e:
                     warnings.append(f"Failed to parse PIC-SURE response for '{term}': {e}")
 
