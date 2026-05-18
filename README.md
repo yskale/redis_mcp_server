@@ -365,6 +365,61 @@ search_concepts(find_variables=true) → picsure_search(phv_ids) → PIC-SURE /q
 
 ---
 
+### `find_cohort_variables`
+
+Find study variables for **multiple biomedical concepts simultaneously** and identify which studies contain variables for all of them — the core tool for multi-condition cohort feasibility analysis.
+
+For each concept, synonym enrichment finds matching variables in the KG. Variables are then looked up in PIC-SURE. Studies are grouped by which concepts they cover: `feasible_studies` have variables for all concepts; `partial_studies` are missing at least one.
+
+A ready-to-submit PIC-SURE query template is generated for the best feasible study.
+
+**Asthma AND obesity cohort:**
+```json
+{ "concepts": ["asthma", "obesity"], "limit": 10 }
+```
+
+**Three-condition query:**
+```json
+{ "concepts": ["asthma", "obesity", "hypertension"], "variables_per_concept": 30 }
+```
+
+Example response shape:
+```json
+{
+  "concepts_searched": ["asthma", "obesity"],
+  "enrichment_summary": [
+    { "concept": "asthma", "curies_found": 12, "variables_in_kg": 20 },
+    { "concept": "obesity", "curies_found": 8, "variables_in_kg": 18 }
+  ],
+  "feasible_studies_count": 3,
+  "feasible_studies": [
+    {
+      "study": "phs000285",
+      "concepts_found": ["asthma", "obesity"],
+      "concepts_missing": [],
+      "variables": [...]
+    }
+  ],
+  "partial_studies": [...],
+  "picsure_query_template": {
+    "resourceUUID": "02e23f52-f354-4e8b-992c-d37c8b9ba140",
+    "query": {
+      "expectedResultType": "COUNT",
+      "categoryFilters": { "\\phs000285\\...\\phv00425822\\p_asth\\": ["Yes"] },
+      "numericFilters": {}
+    },
+    "note": "Submit to POST /query/sync with your BDC auth token. Study: phs000285"
+  }
+}
+```
+
+**Recommended chain for multi-condition cohort building:**
+```
+find_cohort_variables(concepts) → review feasible_studies → submit picsure_query_template to PIC-SURE /query/sync
+```
+
+---
+
 ### `cypher_query`
 
 Execute a raw Cypher query directly against RedisGraph. Use backticks for biolink labels containing dots.

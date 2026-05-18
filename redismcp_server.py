@@ -695,7 +695,44 @@ async def list_tools() -> list[Tool]:
                     }
                 }
             }
-        )
+        ),
+        Tool(
+            name="find_cohort_variables",
+            description=(
+                "Find study variables for multiple biomedical concepts simultaneously and identify "
+                "studies that contain variables for ALL specified concepts — enabling cohort feasibility analysis. "
+                "For each concept, synonym enrichment is used to find matching variables in the knowledge graph. "
+                "Returns feasible_studies (have all concepts) and partial_studies (missing some), with "
+                "PIC-SURE variable paths and a ready-to-submit PIC-SURE query template for the best study. "
+                "Use this to build multi-condition cohort queries (e.g. 'asthma AND obesity')."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "concepts": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "List of biomedical concepts to search for (e.g. ['asthma', 'obesity'])"
+                    },
+                    "require_all": {
+                        "type": "boolean",
+                        "description": "If true (default), only highlight studies that have variables for ALL concepts.",
+                        "default": True
+                    },
+                    "variables_per_concept": {
+                        "type": "integer",
+                        "description": "Max variables to collect per concept from the KG",
+                        "default": 20
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Max number of feasible studies to return",
+                        "default": 10
+                    }
+                },
+                "required": ["concepts"]
+            }
+        ),
     ]
 
 
@@ -1205,6 +1242,193 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 "total_variables_found": len(results),
                 "variables": results,
                 **({"warnings": warnings} if warnings else {}),
+            })
+            if len(out) > 50000:
+                out = out[:50000] + "\n... (truncated)"
+            return [TextContent(type="text", text=out)]
+
+        elif name == "find_cohort_variables":
+            concepts = arguments.get("concepts", [])
+            variables_per_concept = arguments.get("variables_per_concept", 20)
+            limit = arguments.get("limit", 10)
+
+            if not concepts:
+                return [TextContent(type="text", text=to_json({"error": "Provide at least one concept"}))]
+
+            # Step 1: Parallel synonym enrichment for all concepts
+            enrichments = await asyncio.gather(*[
+                fetch_synonyms(c) for c in concepts
+            ], return_exceptions=True)
+
+            all_warnings = []
+            concept_data = []
+            for concept, enrichment in zip(concepts, enrichments):
+                if isinstance(enrichment, Exception):
+                    all_warnings.append(f"Enrichment failed for '{concept}': {enrichment}")
+                    curies, labels = [], [concept]
+                else:
+                    curies = enrichment["curies"]
+                    labels = enrichment["labels"]
+                    all_warnings.extend(enrichment.get("warnings", []))
+                concept_data.append({"concept": concept, "curies": curies, "labels": labels, "variables": []})
+
+            # Step 2: KG query per concept to get linked StudyVariables
+            for cdata in concept_data:
+                where_clauses = []
+                if cdata["curies"]:
+                    curie_list = ", ".join(f'"{c}"' for c in cdata["curies"])
+                    where_clauses.append(f"concept.id IN [{curie_list}]")
+                if cdata["labels"]:
+                    label_list = ", ".join(f'"{l}"' for l in cdata["labels"])
+                    where_clauses.append(f"concept.name IN [{label_list}]")
+                if not where_clauses:
+                    where_clauses.append(f"concept.name CONTAINS '{cdata['concept']}'")
+                where_expr = " OR ".join(where_clauses)
+                kg_query = f"""
+                MATCH (concept)-[r]-(v:`biolink.StudyVariable`)
+                WHERE ({where_expr})
+                  AND NOT labels(concept)[0] = 'biolink.StudyVariable'
+                RETURN DISTINCT v.id AS variable_id, v.name AS variable_name
+                LIMIT {variables_per_concept * 5}
+                """
+                try:
+                    kg_result = graph.query(kg_query)
+                    kg_rows = results_to_list(kg_result.result_set, kg_result.header) if kg_result.result_set else []
+                    seen_ids: set = set()
+                    for row in kg_rows:
+                        vid = row.get("variable_id")
+                        if vid and vid not in seen_ids:
+                            seen_ids.add(vid)
+                            cdata["variables"].append({"variable_id": vid, "variable_name": row.get("variable_name")})
+                            if len(cdata["variables"]) >= variables_per_concept:
+                                break
+                except Exception as e:
+                    all_warnings.append(f"KG query failed for '{cdata['concept']}': {e}")
+
+            # Step 3: Collect all phv IDs across all concepts; map phv → concepts
+            phv_to_concepts: dict = {}
+            for cdata in concept_data:
+                for var in cdata["variables"]:
+                    vid = var["variable_id"] or ""
+                    phv = vid.split(".")[0] if "." in vid else vid
+                    if phv.startswith("phv"):
+                        if phv not in phv_to_concepts:
+                            phv_to_concepts[phv] = []
+                        if cdata["concept"] not in phv_to_concepts[phv]:
+                            phv_to_concepts[phv].append(cdata["concept"])
+
+            all_phv_ids = list(phv_to_concepts.keys())
+
+            # Step 4: PIC-SURE lookup for all phv IDs in parallel
+            picsure_by_phv: dict = {}
+            if all_phv_ids:
+                async with httpx.AsyncClient(timeout=15.0) as client:
+                    ps_responses = await asyncio.gather(*[
+                        client.post(PICSURE_SEARCH_URL, json={"query": phv})
+                        for phv in all_phv_ids
+                    ], return_exceptions=True)
+                for phv, resp in zip(all_phv_ids, ps_responses):
+                    if isinstance(resp, Exception) or getattr(resp, "status_code", 0) != 200:
+                        continue
+                    try:
+                        phenotypes = resp.json().get("results", {}).get("phenotypes", {})
+                        entries = []
+                        for path, meta in list(phenotypes.items())[:5]:
+                            parts = [p for p in path.strip("\\").split("\\") if p]
+                            study = parts[0] if parts else None
+                            if not (study and study.startswith("phs")):
+                                continue
+                            cat_values = meta.get("categoryValues", [])
+                            entries.append({
+                                "picsure_path": path,
+                                "study": study,
+                                "variable_name": parts[-1] if len(parts) > 1 else None,
+                                "categorical": meta.get("categorical"),
+                                "category_values": cat_values[:10],
+                            })
+                        if entries:
+                            picsure_by_phv[phv] = entries
+                    except Exception as e:
+                        all_warnings.append(f"PIC-SURE parse failed for '{phv}': {e}")
+
+            # Step 5: Group by study; find intersection of concepts per study
+            study_concepts: dict = {}   # study → set of concept names
+            study_variables: dict = {}  # study → list of variable entries
+            for phv, entries in picsure_by_phv.items():
+                for entry in entries:
+                    study = entry["study"]
+                    if study not in study_concepts:
+                        study_concepts[study] = set()
+                        study_variables[study] = []
+                    for c in phv_to_concepts.get(phv, []):
+                        study_concepts[study].add(c)
+                    existing_paths = {v["picsure_path"] for v in study_variables[study]}
+                    if entry["picsure_path"] not in existing_paths:
+                        study_variables[study].append({
+                            "phv_id": phv,
+                            "matched_concepts": phv_to_concepts.get(phv, []),
+                            **entry,
+                        })
+
+            all_concept_names = set(cdata["concept"] for cdata in concept_data)
+            feasible_studies = []
+            partial_studies = []
+            for study, concepts_present in sorted(study_concepts.items(), key=lambda x: len(x[1]), reverse=True):
+                missing = all_concept_names - concepts_present
+                entry = {
+                    "study": study,
+                    "concepts_found": sorted(concepts_present),
+                    "concepts_missing": sorted(missing),
+                    "variables": study_variables[study],
+                }
+                if not missing:
+                    feasible_studies.append(entry)
+                else:
+                    partial_studies.append(entry)
+
+            feasible_studies = feasible_studies[:limit]
+            partial_studies = partial_studies[:5]
+
+            # Build a PIC-SURE query template from the best feasible study
+            picsure_query_template = None
+            if feasible_studies:
+                best = feasible_studies[0]
+                category_filters = {}
+                for var in best["variables"]:
+                    path = var["picsure_path"]
+                    if var.get("categorical") and var.get("category_values"):
+                        category_filters[path] = var["category_values"]
+                    elif var.get("categorical"):
+                        category_filters[path] = ["Yes", "1", "TRUE"]
+                picsure_query_template = {
+                    "resourceUUID": "02e23f52-f354-4e8b-992c-d37c8b9ba140",
+                    "query": {
+                        "expectedResultType": "COUNT",
+                        "categoryFilters": category_filters,
+                        "numericFilters": {},
+                        "requiredFields": [],
+                    },
+                    "note": (
+                        f"Submit to POST /query/sync on PIC-SURE with your BDC auth token. "
+                        f"Study: {best['study']}"
+                    ),
+                }
+
+            out = to_json({
+                "concepts_searched": [cdata["concept"] for cdata in concept_data],
+                "enrichment_summary": [
+                    {
+                        "concept": cdata["concept"],
+                        "curies_found": len(cdata["curies"]),
+                        "variables_in_kg": len(cdata["variables"]),
+                    }
+                    for cdata in concept_data
+                ],
+                "feasible_studies_count": len(feasible_studies),
+                "feasible_studies": feasible_studies,
+                "partial_studies": partial_studies,
+                **({"picsure_query_template": picsure_query_template} if picsure_query_template else {}),
+                **({"warnings": all_warnings} if all_warnings else {}),
             })
             if len(out) > 50000:
                 out = out[:50000] + "\n... (truncated)"
