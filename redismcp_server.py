@@ -668,9 +668,11 @@ async def list_tools() -> list[Tool]:
             name="picsure_search",
             description=(
                 "Look up study variables in BioData Catalyst PIC-SURE by phv ID or keyword. "
-                "Use this after search_concepts or trapi_query to get the full PIC-SURE variable paths "
-                "needed to build a cohort query. Returns path, study accession, variable name, "
-                "and whether the variable is categorical or continuous. "
+                "When semantic=true (default when keyword is provided), enriches the keyword via "
+                "Name Resolution SRI + SAP-BERT, queries the knowledge graph for semantically linked "
+                "variables, then looks up their PIC-SURE paths — finding variables related to "
+                "'myocardial infarction', 'MI', etc. when you search 'heart attack'. "
+                "When semantic=false, forwards the keyword directly to PIC-SURE (literal match only). "
                 "No authentication required — uses the open PIC-SURE resource."
             ),
             inputSchema={
@@ -686,11 +688,16 @@ async def list_tools() -> list[Tool]:
                     },
                     "keyword": {
                         "type": "string",
-                        "description": "Free-text keyword to search PIC-SURE variables (e.g. 'asthma'). Used when phv_ids are not available."
+                        "description": "Biomedical concept to search for (e.g. 'heart attack', 'asthma'). With semantic=true, uses KG synonym enrichment."
+                    },
+                    "semantic": {
+                        "type": "boolean",
+                        "description": "If true (default), enrich keyword via Name Resolution SRI + SAP-BERT and query the KG before PIC-SURE lookup. If false, forward keyword directly to PIC-SURE as a literal search.",
+                        "default": True
                     },
                     "limit": {
                         "type": "integer",
-                        "description": "Maximum number of variable paths to return per search term",
+                        "description": "Maximum number of variable paths to return",
                         "default": 20
                     }
                 }
@@ -1184,12 +1191,55 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             return [TextContent(type="text", text=out)]
 
         elif name == "picsure_search":
-            phv_ids = arguments.get("phv_ids", [])
-            keyword = arguments.get("keyword", "")
-            limit   = arguments.get("limit", 20)
+            phv_ids  = arguments.get("phv_ids", [])
+            keyword  = arguments.get("keyword", "")
+            semantic = arguments.get("semantic", True)
+            limit    = arguments.get("limit", 20)
 
             if not phv_ids and not keyword:
                 return [TextContent(type="text", text=to_json({"error": "Provide phv_ids or keyword"}))]
+
+            enrichment_info = None
+            warnings = []
+
+            # Semantic mode: enrich keyword → KG → phv IDs, then PIC-SURE path lookup
+            if keyword and semantic:
+                synonyms = await fetch_synonyms(keyword)
+                curies = synonyms["curies"]
+                labels = synonyms["labels"]
+                warnings.extend(synonyms.get("warnings", []))
+                enrichment_info = {"curies": curies, "labels": labels}
+
+                where_clauses = []
+                if curies:
+                    curie_list = ", ".join(f'"{c}"' for c in curies)
+                    where_clauses.append(f"concept.id IN [{curie_list}]")
+                if labels:
+                    label_list = ", ".join(f'"{l}"' for l in labels)
+                    where_clauses.append(f"concept.name IN [{label_list}]")
+                if not where_clauses:
+                    where_clauses.append(f"concept.name CONTAINS '{keyword}'")
+                where_expr = " OR ".join(where_clauses)
+
+                kg_query = f"""
+                MATCH (concept)-[r]-(v:`biolink.StudyVariable`)
+                WHERE ({where_expr})
+                  AND NOT labels(concept)[0] = 'biolink.StudyVariable'
+                RETURN DISTINCT v.id AS variable_id
+                LIMIT {limit * 5}
+                """
+                kg_result = graph.query(kg_query)
+                kg_rows = results_to_list(kg_result.result_set, kg_result.header) if kg_result.result_set else []
+
+                kg_phv_ids = []
+                for row in kg_rows:
+                    vid = row.get("variable_id") or ""
+                    phv = vid.split(".")[0] if "." in vid else vid
+                    if phv.startswith("phv") and phv not in kg_phv_ids:
+                        kg_phv_ids.append(phv)
+
+                phv_ids = list(dict.fromkeys(list(phv_ids) + kg_phv_ids))
+                keyword = ""  # phv IDs now drive the PIC-SURE lookup
 
             # Strip version suffixes: "phv00425822.v1.p1" → "phv00425822"
             search_terms = [pid.split(".")[0] if "." in pid else pid for pid in phv_ids]
@@ -1198,7 +1248,6 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             search_terms = list(dict.fromkeys(search_terms))  # deduplicate
 
             results = []
-            warnings = []
             async with httpx.AsyncClient(timeout=15.0) as client:
                 responses = await asyncio.gather(*[
                     client.post(PICSURE_SEARCH_URL, json={"query": term})
@@ -1239,6 +1288,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
 
             out = to_json({
                 "search_terms": search_terms,
+                **({"enrichment": enrichment_info} if enrichment_info else {}),
                 "total_variables_found": len(results),
                 "variables": results,
                 **({"warnings": warnings} if warnings else {}),
