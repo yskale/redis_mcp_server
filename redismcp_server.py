@@ -1201,6 +1201,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
 
             enrichment_info = None
             warnings = []
+            original_keyword = keyword  # preserve for output
 
             # Semantic mode: enrich keyword → KG → phv IDs, then PIC-SURE path lookup
             if keyword and semantic:
@@ -1248,6 +1249,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             search_terms = list(dict.fromkeys(search_terms))  # deduplicate
 
             results = []
+            seen_paths: set = set()
             async with httpx.AsyncClient(timeout=15.0) as client:
                 responses = await asyncio.gather(*[
                     client.post(PICSURE_SEARCH_URL, json={"query": term})
@@ -1255,6 +1257,8 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 ], return_exceptions=True)
 
             for term, resp in zip(search_terms, responses):
+                if len(results) >= limit:
+                    break
                 if isinstance(resp, Exception):
                     warnings.append(f"PIC-SURE search failed for '{term}': {resp}")
                     continue
@@ -1263,17 +1267,18 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                     continue
                 try:
                     phenotypes = resp.json().get("results", {}).get("phenotypes", {})
-                    term_count = 0
                     for path, meta in phenotypes.items():
-                        if term_count >= limit:
+                        if len(results) >= limit:
                             break
+                        if path in seen_paths:
+                            continue
+                        seen_paths.add(path)
                         parts = [p for p in path.strip("\\").split("\\") if p]
                         study = parts[0] if parts else None
                         phv   = next((p for p in parts if p.startswith("phv")), None)
                         vname = parts[-1] if len(parts) > 1 else None
                         cat_values = meta.get("categoryValues", [])
                         results.append({
-                            "search_term": term,
                             "picsure_path": path,
                             "study": study,
                             "phv_id": phv,
@@ -1282,12 +1287,12 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                             "category_values": cat_values[:20],
                             "total_category_values": len(cat_values),
                         })
-                        term_count += 1
                 except Exception as e:
                     warnings.append(f"Failed to parse PIC-SURE response for '{term}': {e}")
 
             out = to_json({
-                "search_terms": search_terms,
+                "keyword": original_keyword if original_keyword else None,
+                "mode": "semantic" if (original_keyword and semantic) else "direct",
                 **({"enrichment": enrichment_info} if enrichment_info else {}),
                 "total_variables_found": len(results),
                 "variables": results,
