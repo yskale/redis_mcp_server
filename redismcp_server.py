@@ -1202,6 +1202,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             enrichment_info = None
             warnings = []
             original_keyword = keyword  # preserve for output
+            phv_to_concepts: dict = {}
 
             # Semantic mode: enrich keyword → KG → phv IDs, then PIC-SURE path lookup
             if keyword and semantic:
@@ -1226,18 +1227,25 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 MATCH (concept)-[r]-(v:`biolink.StudyVariable`)
                 WHERE ({where_expr})
                   AND NOT labels(concept)[0] = 'biolink.StudyVariable'
-                RETURN DISTINCT v.id AS variable_id
+                RETURN DISTINCT v.id AS variable_id, concept.id AS concept_id, concept.name AS concept_name
                 LIMIT {limit * 5}
                 """
                 kg_result = graph.query(kg_query)
                 kg_rows = results_to_list(kg_result.result_set, kg_result.header) if kg_result.result_set else []
 
                 kg_phv_ids = []
+                phv_to_concepts: dict = {}
                 for row in kg_rows:
                     vid = row.get("variable_id") or ""
                     phv = vid.split(".")[0] if "." in vid else vid
-                    if phv.startswith("phv") and phv not in kg_phv_ids:
+                    if not phv.startswith("phv"):
+                        continue
+                    if phv not in phv_to_concepts:
+                        phv_to_concepts[phv] = []
                         kg_phv_ids.append(phv)
+                    concept_entry = {"concept_id": row.get("concept_id"), "concept_name": row.get("concept_name")}
+                    if concept_entry not in phv_to_concepts[phv]:
+                        phv_to_concepts[phv].append(concept_entry)
 
                 phv_ids = list(dict.fromkeys(list(phv_ids) + kg_phv_ids))
                 keyword = ""  # phv IDs now drive the PIC-SURE lookup
@@ -1278,7 +1286,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                         phv   = next((p for p in parts if p.startswith("phv")), None)
                         vname = parts[-1] if len(parts) > 1 else None
                         cat_values = meta.get("categoryValues", [])
-                        results.append({
+                        result_entry = {
                             "picsure_path": path,
                             "study": study,
                             "phv_id": phv,
@@ -1286,7 +1294,10 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                             "categorical": meta.get("categorical"),
                             "category_values": cat_values[:20],
                             "total_category_values": len(cat_values),
-                        })
+                        }
+                        if phv and phv in phv_to_concepts:
+                            result_entry["matched_concepts"] = phv_to_concepts[phv]
+                        results.append(result_entry)
                 except Exception as e:
                     warnings.append(f"Failed to parse PIC-SURE response for '{term}': {e}")
 
