@@ -25,7 +25,7 @@ from dotenv import load_dotenv
 import uvicorn
 
 NAME_RESOLUTION_URL = "https://name-resolution-sri.renci.org/lookup"
-SAP_QDRANT_URL = "https://sap-qdrant.example.com/annotate/"
+SAP_QDRANT_URL = "https://sap-qdrant.apps.renci.org/annotate/"
 PICSURE_SEARCH_URL = "https://picsure.biodatacatalyst.nhlbi.nih.gov/picsure/search/ac004461-1b47-4832-80e2-22a4aecabe39"
 
 # Load environment variables from .env file
